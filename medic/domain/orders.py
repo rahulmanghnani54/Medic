@@ -82,6 +82,10 @@ ALLOWED: dict[OrderStatus, frozenset[OrderStatus]] = {
         {
             OrderStatus.AWAITING_FULFILMENT,
             OrderStatus.CANCELLED_NO_CHEMIST,
+            # Sourcing can also end because every chemist asked said the stock
+            # was not there. That is a different signal from "nobody was in
+            # range" and the pilot measures them separately.
+            OrderStatus.CANCELLED_STOCK_OUT,
             OrderStatus.REJECTED_PRESCRIPTION,
             OrderStatus.CANCELLED_BY_CUSTOMER,
         }

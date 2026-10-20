@@ -44,7 +44,7 @@ from medic.domain.orders import (
     gates_cleared,
 )
 from medic.domain.schedules import DrugSchedule
-from medic.models import Chemist, Offer, Order, PrescriptionStatus
+from medic.models import Chemist, Offer, Order, Prescription, PrescriptionStatus
 from medic.services import stock, supply
 from medic.services.audit import audit
 
@@ -68,6 +68,20 @@ def _basket_lines(order: Order) -> list[mt.BasketLine]:
         )
         for item in order.items
     ]
+
+
+def _prescription_refused(session: Session, order: Order) -> bool:
+    """Has a pharmacist refused the prescription backing this order?
+
+    Checked both before an offer goes out and again when one is accepted,
+    because an offer can already be open when the rejection lands.
+    """
+    if order.rx_gate is GateState.FAILED:
+        return True
+    if order.prescription_id is None:
+        return False
+    prescription = session.get(Prescription, order.prescription_id)
+    return prescription is not None and prescription.status is PrescriptionStatus.REJECTED
 
 
 def budget_for(order: Order) -> DeliveryBudget:
@@ -126,14 +140,8 @@ def advance_sourcing(
     # stop the loop here. Without this check the dispatcher keeps offering,
     # a chemist accepts, and stock for a scheduled drug is leased against a
     # prescription a pharmacist has already refused.
-    if order.rx_gate is GateState.FAILED:
+    if _prescription_refused(session, order):
         return _exhaust(session, order, "the prescription was rejected", now=now)
-    if order.prescription_id is not None:
-        from medic.models import Prescription
-
-        prescription = session.get(Prescription, order.prescription_id)
-        if prescription is not None and prescription.status is PrescriptionStatus.REJECTED:
-            return _exhaust(session, order, "the prescription was rejected", now=now)
 
     budget = budget_for(order)
     existing = open_offer(session, order_id)
@@ -218,11 +226,7 @@ def _exhaust(
     """Close an order that sourcing cannot fill, releasing everything it held."""
     supersede_open_offers(session, order.id, reason=reason, now=now)
     stock.release(session, order_id=order.id)
-    status = (
-        OrderStatus.REJECTED_PRESCRIPTION
-        if order.rx_gate is GateState.FAILED
-        else OrderStatus.CANCELLED_NO_CHEMIST
-    )
+    status = _closing_status(session, order)
     assert_can_transition(order.status, status)
     if order.chemist_gate not in (GateState.FAILED, GateState.NOT_REQUIRED):
         assert_gate_transition("chemist", order.chemist_gate, GateState.FAILED)
@@ -240,6 +244,26 @@ def _exhaust(
         detail=reason,
     )
     return SourcingOutcome(action="exhausted", reason=reason)
+
+
+def _closing_status(session: Session, order: Order) -> OrderStatus:
+    """Why did this order fail? The cause matters to the pilot's exit criteria.
+
+    "Most orders delivered within 60 min, low stock-out cancellations" needs
+    stock-outs to stay separable from "nobody was in range". So an order whose
+    every answer was a stock-out closes as CANCELLED_STOCK_OUT, and one that
+    simply ran out of reachable chemists closes as CANCELLED_NO_CHEMIST.
+    """
+    if order.rx_gate is GateState.FAILED:
+        return OrderStatus.REJECTED_PRESCRIPTION
+    answered = [
+        o
+        for o in offers_for(session, order.id)
+        if o.state in (od.OfferState.DECLINED, od.OfferState.WITHDRAWN)
+    ]
+    if answered and all(o.stock_out for o in answered):
+        return OrderStatus.CANCELLED_STOCK_OUT
+    return OrderStatus.CANCELLED_NO_CHEMIST
 
 
 def supersede_open_offers(
@@ -298,6 +322,15 @@ def accept_offer(
     assert order is not None
     if order.status is not OrderStatus.SEEKING_CHEMIST:
         raise DispatchError(f"order {order.id} is {order.status} and is no longer being sourced")
+
+    # The same refusal advance_sourcing makes before offering, repeated here.
+    # An offer can already be open when a pharmacist rejects, so if the
+    # rejection hook is ever lost this is what stops a chemist accepting and
+    # leasing scheduled units against a refused prescription.
+    if _prescription_refused(session, order):
+        raise DispatchError(
+            f"order {order.id} cannot be accepted: the prescription was rejected"
+        )
 
     # Re-run the full admission chain at accept time. The offer may have been
     # open for minutes: a licence can lapse, the shop can close, and the
@@ -370,6 +403,7 @@ def decline_offer(
     offer_id: int,
     chemist_id: int,
     reason: str,
+    stock_out: bool = False,
     now: datetime | None = None,
 ) -> Order:
     """A chemist passes. The order goes back to sourcing, it does not die."""
@@ -386,6 +420,7 @@ def decline_offer(
     offer.state = od.OfferState.DECLINED
     offer.answered_at = now
     offer.reason = reason
+    offer.stock_out = stock_out
 
     order = session.get(Order, offer.order_id)
     assert order is not None
@@ -445,6 +480,9 @@ def withdraw_after_accept(
         accepted.state = od.OfferState.WITHDRAWN
         accepted.answered_at = now
         accepted.reason = reason
+        # A withdrawal after acceptance is a stock-out by definition: the
+        # chemist agreed on declared stock and the shelf disagreed.
+        accepted.stock_out = True
 
     stock.release(session, order_id=order_id, chemist_id=chemist_id)
     assert_gate_transition("chemist", order.chemist_gate, GateState.SEEKING)

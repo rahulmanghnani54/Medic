@@ -369,10 +369,11 @@ def test_a_stock_out_that_exhausts_sourcing_tells_the_customer_they_are_not_char
 ):
     """The money reassurance has to survive the move to an offer loop.
 
-    A stock-out used to close the order as CANCELLED_STOCK_OUT, whose customer
-    message states that nothing has been charged. A stock-out is now a routing
-    event, so the only closure left for one is running out of candidates --
-    and that is where the customer has to be told.
+    A single stock-out is now a routing event rather than a closure, so this
+    only ends the order once every reachable chemist has said the same. The
+    cause still has to survive that loop: the pilot's exit criteria are stated
+    per cause, so an order every chemist refused for lack of stock must not be
+    indistinguishable from one where nobody was in range.
     """
     order = place(client, headers, seeded)
     for _ in range(8):
@@ -386,8 +387,32 @@ def test_a_stock_out_that_exhausts_sourcing_tells_the_customer_they_are_not_char
             headers=headers["chemist"],
         )
     tracked = track(client, headers, order["id"])
-    assert tracked["status"] == "CANCELLED_NO_CHEMIST"
+    assert tracked["status"] == "CANCELLED_STOCK_OUT"
     assert tracked["closed_reason"]
+    assert "not been charged" in tracked["customer_message"]
+
+
+def test_exhausting_sourcing_without_a_stock_out_is_a_different_closure(
+    client, headers, seeded
+):
+    """A chemist who is merely busy is not a stock-out.
+
+    Both closures reassure the customer about money; they differ in what they
+    tell the operator, which is what the pilot measures.
+    """
+    order = place(client, headers, seeded)
+    for _ in range(8):
+        offer = offer_for(client, headers, order["id"])
+        if offer is None:
+            break
+        client.post(
+            f"/api/chemist/offers/{offer['offer_id']}/decline",
+            params={"chemist_id": offer["chemist_id"]},
+            json={"reason": "counter is swamped", "stock_out": False},
+            headers=headers["chemist"],
+        )
+    tracked = track(client, headers, order["id"])
+    assert tracked["status"] == "CANCELLED_NO_CHEMIST"
     assert "not been charged" in tracked["customer_message"]
 
 

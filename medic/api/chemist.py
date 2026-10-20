@@ -93,7 +93,11 @@ def decline(
 ) -> OrderOut:
     """Pass on an offer. The order goes back to sourcing; it does not die."""
     order = dispatching.decline_offer(
-        session, offer_id=offer_id, chemist_id=chemist_id, reason=body.reason
+        session,
+        offer_id=offer_id,
+        chemist_id=chemist_id,
+        reason=body.reason,
+        stock_out=body.stock_out,
     )
     dispatching.advance_sourcing(session, order_id=order.id)
     return order_out(session, order)

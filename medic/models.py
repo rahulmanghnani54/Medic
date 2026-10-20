@@ -417,6 +417,11 @@ class Offer(Base):
     #: remaining budget rather than reused from checkout.
     eta_minutes: Mapped[int] = mapped_column(Integer)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Whether this chemist lost the order because the stock was not there, as
+    #: opposed to being busy or closed. The pilot's exit criteria are stated
+    #: per cause -- "low stock-out cancellations" is a different signal from
+    #: "no chemist in range" -- so the reason has to survive the offer loop.
+    stock_out: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class StockLease(Base):

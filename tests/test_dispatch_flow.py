@@ -714,3 +714,128 @@ def test_orders_carry_the_clinical_urgency_of_their_most_urgent_line(seeded):
     from medic.domain.triage import ClinicalUrgency
 
     assert order.urgency is ClinicalUrgency.TIME_SENSITIVE
+
+
+# --- Why an order failed, and the accept-time prescription re-check --------
+
+
+def decline_until_closed(seeded, order, *, stock_out: bool, now=NOON):
+    for _ in range(8):
+        dispatching.advance_sourcing(seeded, order_id=order.id, now=now)
+        offer = dispatching.open_offer(seeded, order.id)
+        if offer is None:
+            break
+        dispatching.decline_offer(
+            seeded,
+            offer_id=offer.id,
+            chemist_id=offer.chemist_id,
+            reason="shelf is empty" if stock_out else "counter is swamped",
+            stock_out=stock_out,
+            now=now,
+        )
+
+
+def test_an_order_every_chemist_refused_for_stock_closes_as_a_stock_out(seeded):
+    """The cause has to survive the offer loop.
+
+    The pilot's exit criteria are stated per cause -- "low stock-out
+    cancellations" is a different signal from "nobody was in range" -- so
+    collapsing both into one terminal status would make the criterion
+    unmeasurable.
+    """
+    order = place(seeded, otc(seeded))
+    decline_until_closed(seeded, order, stock_out=True)
+    assert order.status is OrderStatus.CANCELLED_STOCK_OUT
+
+
+def test_an_order_refused_for_other_reasons_closes_as_no_chemist(seeded):
+    order = place(seeded, otc(seeded))
+    decline_until_closed(seeded, order, stock_out=False)
+    assert order.status is OrderStatus.CANCELLED_NO_CHEMIST
+
+
+def test_a_mix_of_reasons_is_not_reported_as_a_stock_out(seeded):
+    """Only an unambiguous signal should be recorded as one."""
+    order = place(seeded, otc(seeded))
+    first = dispatching.open_offer(seeded, order.id)
+    dispatching.decline_offer(
+        seeded,
+        offer_id=first.id,
+        chemist_id=first.chemist_id,
+        reason="busy",
+        stock_out=False,
+        now=NOON,
+    )
+    decline_until_closed(seeded, order, stock_out=True)
+    assert order.status is OrderStatus.CANCELLED_NO_CHEMIST
+
+
+def test_a_withdrawal_after_accepting_counts_as_a_stock_out(seeded):
+    """Accepting on declared stock and finding none is the definition of one."""
+    order = place(seeded, otc(seeded))
+    offer = dispatching.open_offer(seeded, order.id)
+    dispatching.accept_offer(seeded, offer_id=offer.id, chemist_id=offer.chemist_id, now=NOON)
+    dispatching.withdraw_after_accept(
+        seeded, order_id=order.id, chemist_id=offer.chemist_id, reason="none left", now=NOON
+    )
+    assert offer.stock_out is True
+    decline_until_closed(seeded, order, stock_out=True)
+    assert order.status is OrderStatus.CANCELLED_STOCK_OUT
+
+
+def test_a_rejected_prescription_cannot_be_accepted_even_with_an_offer_open(seeded):
+    """Defence in depth at the accept, matching the guard before the offer.
+
+    An offer can already be open when a pharmacist rejects. If the rejection
+    hook were ever lost, the guard before the offer would not help -- the
+    offer is already out. Without this check the chemist accepts, the gate
+    reads CLEARED and scheduled units are leased against a refused
+    prescription.
+    """
+    from medic.models import PrescriptionStatus
+
+    prescription = upload(seeded)
+    order = place(
+        seeded,
+        [LineRequest(mid(seeded, "Azithromycin 500mg"), 1)],
+        prescription_id=prescription.id,
+    )
+    offer = dispatching.open_offer(seeded, order.id)
+    prescription.status = PrescriptionStatus.REJECTED  # simulate a lost hook
+    seeded.flush()
+
+    with pytest.raises(DispatchError, match="prescription was rejected"):
+        dispatching.accept_offer(
+            seeded, offer_id=offer.id, chemist_id=offer.chemist_id, now=NOON
+        )
+    assert order.chemist_id is None
+    assert order.chemist_gate is not GateState.CLEARED
+    held = [
+        lease
+        for lease in seeded.scalars(select(StockLease).where(StockLease.order_id == order.id))
+        if lease.state == "HELD"
+    ]
+    assert held == []
+
+
+def test_verification_passes_the_order_clock_to_the_dispatcher(seeded):
+    """A verification must not re-score the order against the wall clock.
+
+    Chemist opening hours and the remaining budget are both time-dependent, so
+    falling back to `now()` here would let a replayed or delayed verification
+    exhaust an order simply because the shops are shut at the replay instant.
+    """
+    prescription = upload(seeded)
+    azithro = mid(seeded, "Azithromycin 500mg")
+    order = place(seeded, [LineRequest(azithro, 1)], prescription_id=prescription.id)
+    offer = dispatching.open_offer(seeded, order.id)
+    dispatching.accept_offer(seeded, offer_id=offer.id, chemist_id=offer.chemist_id, now=NOON)
+    ordering.verify_prescription(
+        seeded,
+        prescription_id=prescription.id,
+        authorisations=[(azithro, 1)],
+        pharmacist="Ph. R Nair",
+        now=NOON,
+    )
+    assert order.verified_at == NOON
+    assert order.status is OrderStatus.READY_FOR_PICKUP

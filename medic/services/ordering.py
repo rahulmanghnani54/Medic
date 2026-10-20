@@ -199,6 +199,7 @@ def verify_prescription(
     prescriber_name: str | None = None,
     prescriber_reg_no: str | None = None,
     issued_on: datetime | None = None,
+    now: datetime | None = None,
 ) -> Prescription:
     """Record a pharmacist's verification: which medicines, in what quantity."""
     prescription = session.get(Prescription, prescription_id)
@@ -242,7 +243,7 @@ def verify_prescription(
         detail=f"authorised={authorisations}",
     )
     for order in _orders_awaiting(session, prescription.id):
-        _clear_rx_gate(session, order, pharmacist)
+        _clear_rx_gate(session, order, pharmacist, now=now)
     return prescription
 
 
@@ -666,10 +667,13 @@ def _close_order(
     )
 
 
-def _clear_rx_gate(session: Session, order: Order, actor: str) -> None:
+def _clear_rx_gate(
+    session: Session, order: Order, actor: str, *, now: datetime | None = None
+) -> None:
+    now = now or _now()
     assert_gate_transition("prescription", order.rx_gate, GateState.CLEARED)
     order.rx_gate = GateState.CLEARED
-    order.verified_at = _now()
+    order.verified_at = now
     session.flush()
     _audit(
         session,
@@ -683,7 +687,12 @@ def _clear_rx_gate(session: Session, order: Order, actor: str) -> None:
     # not make it ready -- there is no chemist yet -- but it does unblock the
     # next offer round, so nudge the dispatcher.
     if order.status is OrderStatus.SEEKING_CHEMIST:
-        dispatching.advance_sourcing(session, order_id=order.id)
+        # Pass the clock through. Falling back to the wall clock here would
+        # re-score chemist opening hours and the remaining budget against the
+        # moment of verification rather than the order's own clock, so a
+        # replayed or delayed verification could exhaust an order simply
+        # because the shops are shut at the replay instant.
+        dispatching.advance_sourcing(session, order_id=order.id, now=now)
 
 
 def cancel_by_customer(session: Session, *, order_id: int, customer_id: int, reason: str) -> Order:
@@ -717,7 +726,14 @@ def cancel_by_customer(session: Session, *, order_id: int, customer_id: int, rea
     return order
 
 
-def dispatch(session: Session, *, order_id: int, rider: str, actor: str = "admin") -> Order:
+def dispatch(
+    session: Session,
+    *,
+    order_id: int,
+    rider: str,
+    actor: str = "admin",
+    now: datetime | None = None,
+) -> Order:
     """Operator override for collection, kept for the admin console.
 
     Routed through the dispensing service so it cannot diverge from the
@@ -727,10 +743,11 @@ def dispatch(session: Session, *, order_id: int, rider: str, actor: str = "admin
     order = session.get(Order, order_id)
     if order is None:
         raise OrderingError(f"unknown order {order_id}")
+    now = now or _now()
     od.assert_can_transition(order.status, OrderStatus.OUT_FOR_DELIVERY)
-    dispensing.dispense(session, order=order, courier_id=None, actor=actor)
+    dispensing.dispense(session, order=order, courier_id=None, actor=actor, now=now)
     order.status = OrderStatus.OUT_FOR_DELIVERY
-    order.dispatched_at = _now()
+    order.dispatched_at = now
     session.flush()
     _audit(
         session,
@@ -743,13 +760,15 @@ def dispatch(session: Session, *, order_id: int, rider: str, actor: str = "admin
     return order
 
 
-def deliver(session: Session, *, order_id: int, actor: str = "admin") -> Order:
+def deliver(
+    session: Session, *, order_id: int, actor: str = "admin", now: datetime | None = None
+) -> Order:
     order = session.get(Order, order_id)
     if order is None:
         raise OrderingError(f"unknown order {order_id}")
     od.assert_can_transition(order.status, OrderStatus.DELIVERED)
 
-    now = _now()
+    now = now or _now()
     order.status = OrderStatus.DELIVERED
     order.delivered_at = now
     sla = od.sla_view(order.created_at, order.promised_minutes, now)
