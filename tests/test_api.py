@@ -13,6 +13,79 @@ def medicine_id(session, name) -> int:
 
 MALVIYA = {"delivery_lat": 26.8505, "delivery_lng": 75.8060}
 
+#: Midway between the two 24x7 partners, so at least two chemists are open and
+#: inside the match radius whatever hour the suite runs at. Used by every test
+#: that turns on a refusal being RE-OFFERED: at Malviya Nagar the 24x7 flagship
+#: is often the only open candidate, and declining the only candidate
+#: legitimately exhausts sourcing instead.
+TONK_ROAD = {"delivery_lat": 26.8785, "delivery_lng": 75.8023}
+
+#: The seeded partner chemists. Which of them holds an order's offer depends on
+#: who is open at the hour the suite runs, so tests find the offer rather than
+#: assume its offeree.
+CHEMIST_IDS = (1, 2, 3, 4, 5)
+
+
+def place(
+    client,
+    headers,
+    seeded,
+    name: str = "Paracetamol 650mg",
+    *,
+    near: dict = MALVIYA,
+    zone: str = "Malviya Nagar",
+    prescription_id: int | None = None,
+) -> dict:
+    """Place a one-line order over HTTP and return the tracking body."""
+    body = {
+        "customer_id": 1,
+        "lines": [{"medicine_id": medicine_id(seeded, name), "qty": 1}],
+        "delivery_zone": zone,
+        **near,
+    }
+    if prescription_id is not None:
+        body["prescription_id"] = prescription_id
+    response = client.post("/api/customer/orders", json=body, headers=headers["customer"])
+    assert response.status_code == 201
+    return response.json()
+
+
+def offer_for(client, headers, order_id: int) -> dict | None:
+    """The open offer for an order, read off the chemist consoles.
+
+    Which chemist holds it depends on who is open at the hour the suite runs,
+    so this asks every console rather than assuming one. At most one offer is
+    ever open for an order: an offer leases stock, so dispatch never broadcasts.
+    """
+    rows = [
+        row
+        for chemist_id in CHEMIST_IDS
+        for row in client.get(
+            f"/api/chemist/{chemist_id}/offers", headers=headers["chemist"]
+        ).json()
+        if row["order_id"] == order_id
+    ]
+    assert len(rows) <= 1
+    return rows[0] if rows else None
+
+
+def accept(client, headers, offer: dict) -> dict:
+    response = client.post(
+        f"/api/chemist/offers/{offer['offer_id']}/accept",
+        params={"chemist_id": offer["chemist_id"]},
+        headers=headers["chemist"],
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def track(client, headers, order_id: int) -> dict:
+    return client.get(
+        f"/api/customer/orders/{order_id}",
+        params={"customer_id": 1},
+        headers=headers["customer"],
+    ).json()
+
 
 # --- Auth -----------------------------------------------------------------
 
@@ -59,7 +132,7 @@ def test_search_matches_on_composition(client, headers):
 # --- Quote and checkout ---------------------------------------------------
 
 
-def test_a_quote_shows_the_eta_and_the_promise(client, headers, seeded):
+def test_a_quote_shows_the_eta_band_and_the_promise(client, headers, seeded):
     response = client.post(
         "/api/customer/quote",
         json={
@@ -72,9 +145,30 @@ def test_a_quote_shows_the_eta_and_the_promise(client, headers, seeded):
     assert response.status_code == 200
     body = response.json()
     assert body["promise_minutes"] == 60
-    assert 0 < body["eta_minutes"] <= 60
+    assert body["feasible"] is True
+    assert body["candidate_count"] >= 1
+    assert 0 < body["eta_minutes_low"] <= body["eta_minutes_high"] <= 60
     assert body["requires_prescription"] is False
-    assert body["chemist_name"]
+
+
+def test_a_quote_names_no_chemist(client, headers, seeded):
+    """The absence is the invariant: nobody has agreed to anything yet.
+
+    Naming a chemist, or stating one ETA instead of a band, would announce a
+    commitment the platform has not obtained from anybody.
+    """
+    body = client.post(
+        "/api/customer/quote",
+        json={
+            "customer_id": 1,
+            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
+            **MALVIYA,
+        },
+        headers=headers["customer"],
+    ).json()
+    assert "chemist_id" not in body
+    assert "chemist_name" not in body
+    assert "eta_minutes" not in body
 
 
 def test_placing_an_otc_order_returns_a_tracking_body(client, headers, seeded):
@@ -90,10 +184,20 @@ def test_placing_an_otc_order_returns_a_tracking_body(client, headers, seeded):
     )
     assert response.status_code == 201
     body = response.json()
-    assert body["status"] == "AWAITING_FULFILMENT"
+    assert body["status"] == "SEEKING_CHEMIST"
     assert body["prescription_gate"] == "NOT_REQUIRED"
+    assert body["urgency"] == "ELECTIVE"
     assert body["minutes_remaining"] <= 60
-    assert "confirming stock" in body["customer_message"]
+    assert "Finding a partner chemist" in body["customer_message"]
+
+
+def test_a_placed_order_names_no_chemist_until_one_accepts(client, headers, seeded):
+    """Checkout carries no assignment, so it carries no firm promise either."""
+    body = place(client, headers, seeded)
+    assert body["chemist_id"] is None
+    assert body["chemist_name"] is None
+    assert body["committed_eta_minutes"] is None
+    assert body["sourcing_attempts"] == 1  # the first offer goes out at once
 
 
 def test_a_schedule_x_order_is_refused_with_451_and_an_explanation(client, headers, seeded):
@@ -142,22 +246,149 @@ def test_a_zero_quantity_line_is_rejected_by_validation(client, headers, seeded)
 
 
 def test_tracking_someone_elses_order_returns_404(client, headers, seeded):
-    placed = client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    ).json()
+    placed = place(client, headers, seeded)
     response = client.get(
         f"/api/customer/orders/{placed['id']}",
         params={"customer_id": 2},
         headers=headers["customer"],
     )
     assert response.status_code == 404
+
+
+# --- The offer loop on the chemist console --------------------------------
+
+
+def test_one_chemist_at_a_time_holds_an_open_offer_with_a_countdown(client, headers, seeded):
+    """An offer leases stock, so it goes to one chemist and carries a timer."""
+    order = place(client, headers, seeded)
+    offer = offer_for(client, headers, order["id"])
+    assert offer is not None
+    assert offer["state"] == "OFFERED"
+    assert offer["attempt_seq"] == 1
+    assert offer["eta_minutes"] > 0
+    assert offer["expires_in_seconds"] > 0
+
+
+def test_a_chemist_holding_no_offer_for_an_order_cannot_accept_it(client, headers, seeded):
+    """Why acceptance is keyed on the offer rather than on the order.
+
+    An order id used to be enough, so any chemist who could guess one could
+    accept it. An offer names its offeree, so a chemist who was never asked is
+    refused and the order stays in sourcing.
+    """
+    order = place(client, headers, seeded)
+    offer = offer_for(client, headers, order["id"])
+    intruder = next(cid for cid in CHEMIST_IDS if cid != offer["chemist_id"])
+    response = client.post(
+        f"/api/chemist/offers/{offer['offer_id']}/accept",
+        params={"chemist_id": intruder},
+        headers=headers["chemist"],
+    )
+    assert response.status_code == 409
+    assert response.json()["error"] == "dispatch_error"
+    assert "not made to you" in response.json()["detail"]
+    tracked = track(client, headers, order["id"])
+    assert tracked["status"] == "SEEKING_CHEMIST"
+    assert tracked["chemist_id"] is None
+
+
+def test_accepting_an_offer_binds_the_chemist_and_commits_an_eta(client, headers, seeded):
+    order = place(client, headers, seeded)
+    offer = offer_for(client, headers, order["id"])
+    accepted = accept(client, headers, offer)
+    assert accepted["chemist_gate"] == "CLEARED"
+    assert accepted["chemist_id"] == offer["chemist_id"]
+    assert accepted["committed_eta_minutes"] is not None
+    assert accepted["status"] == "READY_FOR_PICKUP"  # OTC: both gates clear at once
+
+
+def test_a_chemist_who_cannot_cover_the_basket_is_refused_at_accept(client, headers, seeded):
+    """The shelf can move while an offer is open, and then nothing is bound."""
+    order = place(client, headers, seeded)
+    offer = offer_for(client, headers, order["id"])
+    client.put(
+        f"/api/chemist/{offer['chemist_id']}/stock",
+        json=[
+            {
+                "medicine_id": medicine_id(seeded, "Paracetamol 650mg"),
+                "qty_on_hand": 0,
+                "source": "synced",
+            }
+        ],
+        headers=headers["chemist"],
+    )
+    response = client.post(
+        f"/api/chemist/offers/{offer['offer_id']}/accept",
+        params={"chemist_id": offer["chemist_id"]},
+        headers=headers["chemist"],
+    )
+    assert response.status_code == 409
+    assert response.json()["error"] == "insufficient_stock"
+    tracked = track(client, headers, order["id"])
+    assert tracked["status"] == "SEEKING_CHEMIST"
+    assert tracked["chemist_id"] is None
+
+
+def test_a_chemist_declining_for_stock_out_does_not_kill_the_order(client, headers, seeded):
+    """The asymmetry on the HTTP surface: supply refusing is a routing event."""
+    order = place(client, headers, seeded, near=TONK_ROAD, zone="Tonk Road")
+    first = offer_for(client, headers, order["id"])
+    declined = client.post(
+        f"/api/chemist/offers/{first['offer_id']}/decline",
+        params={"chemist_id": first["chemist_id"]},
+        json={"reason": "shelf is empty", "stock_out": True},
+        headers=headers["chemist"],
+    )
+    assert declined.status_code == 200
+    assert declined.json()["status"] == "SEEKING_CHEMIST"
+    second = offer_for(client, headers, order["id"])
+    assert second is not None
+    assert second["chemist_id"] != first["chemist_id"]
+    assert second["attempt_seq"] == first["attempt_seq"] + 1
+
+
+def test_a_chemist_who_accepted_can_hand_the_order_back(client, headers, seeded):
+    """An accept is a claim about declared stock; shelf truth comes later."""
+    order = place(client, headers, seeded, near=TONK_ROAD, zone="Tonk Road")
+    offer = offer_for(client, headers, order["id"])
+    accept(client, headers, offer)
+    withdrawn = client.post(
+        f"/api/chemist/{offer['chemist_id']}/orders/{order['id']}/withdraw",
+        json={"reason": "strip missing from the shelf", "stock_out": True},
+        headers=headers["chemist"],
+    )
+    assert withdrawn.status_code == 200
+    body = withdrawn.json()
+    assert body["status"] == "SEEKING_CHEMIST"
+    assert body["chemist_id"] is None
+    assert body["committed_eta_minutes"] is None
+
+
+def test_a_stock_out_that_exhausts_sourcing_tells_the_customer_they_are_not_charged(
+    client, headers, seeded
+):
+    """The money reassurance has to survive the move to an offer loop.
+
+    A stock-out used to close the order as CANCELLED_STOCK_OUT, whose customer
+    message states that nothing has been charged. A stock-out is now a routing
+    event, so the only closure left for one is running out of candidates --
+    and that is where the customer has to be told.
+    """
+    order = place(client, headers, seeded)
+    for _ in range(8):
+        offer = offer_for(client, headers, order["id"])
+        if offer is None:
+            break
+        client.post(
+            f"/api/chemist/offers/{offer['offer_id']}/decline",
+            params={"chemist_id": offer["chemist_id"]},
+            json={"reason": "shelf is empty", "stock_out": True},
+            headers=headers["chemist"],
+        )
+    tracked = track(client, headers, order["id"])
+    assert tracked["status"] == "CANCELLED_NO_CHEMIST"
+    assert tracked["closed_reason"]
+    assert "not been charged" in tracked["customer_message"]
 
 
 # --- Full journey across all three consoles -------------------------------
@@ -178,30 +409,21 @@ def test_a_prescription_order_crosses_all_three_consoles(client, headers, seeded
     prescription_id = upload.json()["id"]
     assert upload.json()["status"] == "PENDING"
 
-    # Customer places the order; it waits at the verification gate.
-    order = client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": azithro, "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            "prescription_id": prescription_id,
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    ).json()
+    # Customer places the order; sourcing and verification run side by side.
+    order = place(client, headers, seeded, "Azithromycin 500mg", prescription_id=prescription_id)
+    assert order["status"] == "SEEKING_CHEMIST"
     assert order["prescription_gate"] == "PENDING"
     assert "pharmacist is verifying" in order["customer_message"]
-    chemist_id = order["chemist_id"]
 
-    # Chemist sees it and confirms stock.
+    # The first offer is already out. The chemist holding it sees it and accepts.
+    offer = offer_for(client, headers, order["id"])
+    assert offer is not None
+    chemist_id = offer["chemist_id"]
     queue = client.get(
         f"/api/chemist/{chemist_id}/orders", headers=headers["chemist"]
     ).json()
     assert [row["id"] for row in queue] == [order["id"]]
-    accepted = client.post(
-        f"/api/chemist/{chemist_id}/orders/{order['id']}/accept", headers=headers["chemist"]
-    ).json()
+    accepted = accept(client, headers, offer)
     assert accepted["chemist_gate"] == "CLEARED"
     assert accepted["status"] == "AWAITING_FULFILMENT"  # still waiting on the pharmacist
 
@@ -225,11 +447,7 @@ def test_a_prescription_order_crosses_all_three_consoles(client, headers, seeded
     assert verified.json()["status"] == "VERIFIED"
 
     # Both gates clear, so the order is ready.
-    tracked = client.get(
-        f"/api/customer/orders/{order['id']}",
-        params={"customer_id": 1},
-        headers=headers["customer"],
-    ).json()
+    tracked = track(client, headers, order["id"])
     assert tracked["status"] == "READY_FOR_PICKUP"
 
     # Admin dispatches and delivers.
@@ -256,27 +474,18 @@ def test_a_prescription_order_crosses_all_three_consoles(client, headers, seeded
 
 
 def test_an_otc_order_leaves_the_register_empty(client, headers, seeded):
-    order = client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    ).json()
-    chemist_id = order["chemist_id"]
-    client.post(
-        f"/api/chemist/{chemist_id}/orders/{order['id']}/accept", headers=headers["chemist"]
-    )
-    client.post(
+    order = place(client, headers, seeded)
+    offer = offer_for(client, headers, order["id"])
+    accepted = accept(client, headers, offer)
+    assert accepted["status"] == "READY_FOR_PICKUP"
+    dispatched = client.post(
         f"/api/admin/orders/{order['id']}/dispatch",
         json={"rider": "rider-7"},
         headers=headers["admin"],
-    )
+    ).json()
+    assert dispatched["status"] == "OUT_FOR_DELIVERY"
     register = client.get(
-        f"/api/chemist/{chemist_id}/register.csv", headers=headers["chemist"]
+        f"/api/chemist/{offer['chemist_id']}/register.csv", headers=headers["chemist"]
     )
     assert len(register.text.strip().splitlines()) == 1  # header only
 
@@ -333,44 +542,26 @@ def test_an_unknown_chemist_is_a_404(client, headers):
     assert client.get("/api/chemist/999/orders", headers=headers["chemist"]).status_code == 404
 
 
-def test_a_stock_out_rejection_tells_the_customer_they_are_not_charged(client, headers, seeded):
-    order = client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    ).json()
-    rejected = client.post(
-        f"/api/chemist/{order['chemist_id']}/orders/{order['id']}/reject",
-        json={"reason": "shelf is empty", "stock_out": True},
-        headers=headers["chemist"],
-    ).json()
-    assert rejected["status"] == "CANCELLED_STOCK_OUT"
-    assert "not been charged" in rejected["customer_message"]
-
-
 # --- Admin console --------------------------------------------------------
 
 
 def test_the_sla_board_lists_live_orders_and_what_they_wait_on(client, headers, seeded):
-    client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    )
+    """An order being sourced is live: its clock runs with no chemist bound."""
+    place(client, headers, seeded)
     board = client.get("/api/admin/sla", headers=headers["admin"]).json()
     assert len(board) == 1
-    assert board[0]["waiting_on"] == "chemist to confirm stock"
+    assert board[0]["status"] == "SEEKING_CHEMIST"
+    assert board[0]["waiting_on"] == "a chemist to accept"
     assert board[0]["breached"] is False
+
+
+def test_the_dispatch_board_shows_the_offer_funnel(client, headers, seeded):
+    """The diagnostic the synchronous design could not produce: who was asked."""
+    order = place(client, headers, seeded)
+    board = client.get("/api/admin/dispatch", headers=headers["admin"]).json()
+    assert board["offers_by_state"]["OFFERED"] == 1
+    assert [row["order_id"] for row in board["open_offers"]] == [order["id"]]
+    assert [row["order_id"] for row in board["seeking_chemist"]] == [order["id"]]
 
 
 def test_the_economics_endpoint_reports_zero_before_any_delivery(client, headers):
@@ -389,19 +580,14 @@ def test_the_catalogue_console_exposes_the_schedule_tagging(client, headers):
 
 
 def test_the_audit_log_is_readable(client, headers, seeded):
-    client.post(
-        "/api/customer/orders",
-        json={
-            "customer_id": 1,
-            "lines": [{"medicine_id": medicine_id(seeded, "Paracetamol 650mg"), "qty": 1}],
-            "delivery_zone": "Malviya Nagar",
-            **MALVIYA,
-        },
-        headers=headers["customer"],
-    )
+    place(client, headers, seeded)
     events = client.get("/api/admin/audit", headers=headers["admin"]).json()
-    assert events[0]["action"] == "order.placed"
-    assert events[0]["actor"] == "customer:1"
+    # Newest first, and placing an order makes the first offer at once, so the
+    # dispatcher's event sits on top of the customer's.
+    assert events[0]["action"] == "offer.made"
+    assert events[0]["actor"] == "dispatcher"
+    placed = next(event for event in events if event["action"] == "order.placed")
+    assert placed["actor"] == "customer:1"
 
 
 def test_the_three_consoles_are_served(client):

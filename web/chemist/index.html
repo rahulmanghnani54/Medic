@@ -27,15 +27,21 @@
       </div>
     </div>
     <p class="note">
-      Accepting an order means the stock is physically on your shelf. If it is not,
-      reject it as a stock-out — that is faster for the patient than a late cancellation,
-      and it does not count against you the way a missed delivery does.
+      Offers expire. If you do not answer, the order goes to the next chemist — the
+      patient is not left waiting on you. Accepting means the stock is physically on
+      your shelf; if it turns out not to be, hand the order back and it is re-offered
+      rather than cancelled.
     </p>
   </section>
 
   <section>
-    <h2>Live orders</h2>
-    <div id="orders"><p class="empty">Nothing waiting.</p></div>
+    <h2>Offers waiting on you</h2>
+    <div id="offers"><p class="empty">No offer right now.</p></div>
+  </section>
+
+  <section>
+    <h2>Orders you have taken</h2>
+    <div id="orders"><p class="empty">Nothing in progress.</p></div>
   </section>
 
   <section>
@@ -49,7 +55,8 @@
 </main>
 
 <script type="module">
-import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+import { api, el, banner, clearBanner, setChildren, statusPill, schedulePill, pageHeader }
+  from '/static/api.js';
 
 // The pilot's seeded partner chemists. A real dashboard scopes this to the logged-in store.
 const STORES = [
@@ -70,23 +77,100 @@ function updateRegisterLink() {
   $('register').href = `/api/chemist/${chemistId()}/register.csv`;
 }
 
+// Offer expiry is counted down locally from the first sighting, so the number
+// keeps ticking between the 8-second polls instead of jumping.
+const offerDeadlines = new Map();
+
+async function loadOffers() {
+  try {
+    const offers = await api('chemist', `/api/chemist/${chemistId()}/offers`);
+    const live = new Set(offers.map((o) => o.offer_id));
+    for (const id of offerDeadlines.keys()) if (!live.has(id)) offerDeadlines.delete(id);
+    for (const o of offers) {
+      if (!offerDeadlines.has(o.offer_id)) {
+        offerDeadlines.set(o.offer_id, Date.now() + o.expires_in_seconds * 1000);
+      }
+    }
+    if (!offers.length) {
+      return setChildren($('offers'), el('p', { class: 'empty', text: 'No offer right now.' }));
+    }
+    setChildren($('offers'), ...offers.map(offerCard));
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function secondsLeft(offerId) {
+  const at = offerDeadlines.get(offerId);
+  return at ? Math.max(0, Math.round((at - Date.now()) / 1000)) : 0;
+}
+
+function offerCard(offer) {
+  const left = secondsLeft(offer.offer_id);
+  return el('div', { class: 'stat', style: 'margin-bottom:10px' },
+    el('div', { class: 'flex' },
+      el('strong', { text: `Order #${offer.order_id}` }),
+      el('span', { class: 'pill rx', text: `attempt ${offer.attempt_seq}` }),
+      el('span', { class: 'pill wait', text: `${offer.eta_minutes} min to the patient` }),
+      el('span', {
+        class: `pill ${left < 60 ? 'bad' : 'ok'}`,
+        'data-countdown': offer.offer_id,
+        text: `${left}s to answer`,
+      })),
+    el('div', { class: 'flex', style: 'margin-top:10px' },
+      el('button', { onclick: () => acceptOffer(offer.offer_id) }, 'Accept — stock confirmed'),
+      el('button', { class: 'danger', onclick: () => declineOffer(offer.offer_id) }, 'Pass')),
+  );
+}
+
+setInterval(() => {
+  for (const node of document.querySelectorAll('[data-countdown]')) {
+    const left = secondsLeft(Number(node.dataset.countdown));
+    node.textContent = `${left}s to answer`;
+    node.className = `pill ${left < 60 ? 'bad' : 'ok'}`;
+  }
+}, 1000);
+
+async function acceptOffer(offerId) {
+  try {
+    await api('chemist', `/api/chemist/offers/${offerId}/accept?chemist_id=${chemistId()}`,
+      { method: 'POST' });
+    await refreshAll();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function declineOffer(offerId) {
+  const reason = prompt('Why are you passing on this one?', 'not in stock');
+  if (!reason) return;
+  try {
+    await api('chemist', `/api/chemist/offers/${offerId}/decline?chemist_id=${chemistId()}`, {
+      method: 'POST', body: { reason, stock_out: true },
+    });
+    banner($('banner'), 'ok', 'Passed. The order has gone to the next chemist.');
+    await refreshAll();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
 async function loadOrders() {
-  clearBanner($('banner'));
   try {
     const orders = await api('chemist', `/api/chemist/${chemistId()}/orders`);
-    if (!orders.length) {
-      return $('orders').replaceChildren(el('p', { class: 'empty', text: 'Nothing waiting.' }));
+    const taken = orders.filter((o) => o.chemist_id === chemistId());
+    if (!taken.length) {
+      return setChildren($('orders'), el('p', { class: 'empty', text: 'Nothing in progress.' }));
     }
-    $('orders').replaceChildren(...orders.map(orderCard));
+    setChildren($('orders'), ...taken.map(orderCard));
   } catch (err) {
     banner($('banner'), 'err', err.message);
   }
 }
 
 function orderCard(order) {
-  const pending = order.chemist_gate === 'PENDING';
-  const withdrawable = ['AWAITING_FULFILMENT', 'READY_FOR_PICKUP'].includes(order.status);
   const late = order.sla_breached;
+  const canWithdraw = ['AWAITING_FULFILMENT', 'READY_FOR_PICKUP'].includes(order.status);
   return el('div', { class: 'stat', style: 'margin-bottom:10px' },
     el('div', { class: 'flex' },
       el('strong', { text: `Order #${order.id}` }),
@@ -104,36 +188,30 @@ function orderCard(order) {
           el('td', {}, schedulePill(item.schedule)),
           el('td', { class: 'num', text: `× ${item.qty}` }),
           el('td', { class: 'num', text: `₹${item.line_total}` }))))),
-    el('div', { class: 'flex' },
-      pending
-        ? el('button', { onclick: () => accept(order.id) }, 'Accept — stock confirmed')
-        : el('span', { class: 'pill ok', text: 'stock confirmed' }),
-      withdrawable
-        ? el('button', { class: 'danger', onclick: () => reject(order.id) }, 'Stock-out')
-        : null),
+    canWithdraw
+      ? el('div', { class: 'flex' },
+          el('button', { class: 'danger', onclick: () => withdraw(order.id) },
+            'Hand back — not on the shelf'))
+      : null,
   );
 }
 
-async function accept(orderId) {
+async function withdraw(orderId) {
+  const reason = prompt('What happened?', 'strip not on the shelf');
+  if (!reason) return;
   try {
-    await api('chemist', `/api/chemist/${chemistId()}/orders/${orderId}/accept`, { method: 'POST' });
-    await Promise.all([loadOrders(), loadStock()]);
+    await api('chemist', `/api/chemist/${chemistId()}/orders/${orderId}/withdraw`, {
+      method: 'POST', body: { reason, stock_out: true },
+    });
+    banner($('banner'), 'ok', 'Handed back. The order is being re-offered.');
+    await refreshAll();
   } catch (err) {
     banner($('banner'), 'err', err.message);
   }
 }
 
-async function reject(orderId) {
-  const reason = prompt('Reason (the patient is told this):', 'not in stock');
-  if (!reason) return;
-  try {
-    await api('chemist', `/api/chemist/${chemistId()}/orders/${orderId}/reject`, {
-      method: 'POST', body: { reason, stock_out: true },
-    });
-    await Promise.all([loadOrders(), loadStock()]);
-  } catch (err) {
-    banner($('banner'), 'err', err.message);
-  }
+async function refreshAll() {
+  await Promise.all([loadOffers(), loadOrders(), loadStock()]);
 }
 
 async function loadStock() {
@@ -187,10 +265,10 @@ async function saveStock(medicineId, button) {
 
 $('chemist').addEventListener('change', () => {
   updateRegisterLink();
-  loadOrders();
-  loadStock();
+  offerDeadlines.clear();
+  refreshAll();
 });
-$('refresh').addEventListener('click', () => { loadOrders(); loadStock(); });
+$('refresh').addEventListener('click', refreshAll);
 
 // The register download needs the role header, which a plain link cannot send.
 $('register').addEventListener('click', async (event) => {
@@ -210,9 +288,8 @@ $('register').addEventListener('click', async (event) => {
 });
 
 updateRegisterLink();
-loadOrders();
-loadStock();
-setInterval(loadOrders, 8000);
+refreshAll();
+setInterval(() => { loadOffers(); loadOrders(); }, 8000);
 </script>
 </body>
 </html>

@@ -9,6 +9,12 @@ export const TOKENS = {
   chemist: 'dev-chemist-token',
   pharmacist: 'dev-pharmacist-token',
   admin: 'dev-admin-token',
+  // No shared courier token on purpose. Couriers authenticate as individuals,
+  // because the Schedule H1 register records which one took custody of a
+  // package and a fleet-wide secret cannot answer that. The courier console
+  // writes the signed-in rider's own token into localStorage, which is where
+  // tokenFor() looks first.
+  courier: null,
 };
 
 export function tokenFor(role) {
@@ -64,6 +70,13 @@ export function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// replaceChildren() stringifies null into a literal "null" text node, unlike
+// el(), which skips it. Any call site that builds a child list with
+// conditionals has to go through here.
+export function setChildren(host, ...children) {
+  host.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+}
+
 export function banner(host, kind, message) {
   host.replaceChildren(el('div', { class: `banner ${kind}`, text: message }));
 }
@@ -113,6 +126,7 @@ export function pageHeader(title, role) {
       {},
       el('a', { href: '/customer/', text: 'Customer' }),
       el('a', { href: '/chemist/', text: 'Chemist' }),
+      el('a', { href: '/courier/', text: 'Courier' }),
       el('a', { href: '/admin/', text: 'Admin' }),
       el('a', { href: '/docs', text: 'API' }),
     ),

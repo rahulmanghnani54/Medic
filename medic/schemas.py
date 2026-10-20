@@ -45,14 +45,22 @@ class QuoteLineOut(BaseModel):
 
 
 class QuoteOut(BaseModel):
+    """A quote states a band, never a promise.
+
+    It deliberately carries no chemist identity: at quote time nobody has
+    agreed to anything, and naming a chemist would be stating a commitment
+    the platform has not obtained.
+    """
+
     lines: list[QuoteLineOut]
     subtotal: str
     chemist_funded_discount: str
     delivery_fee: str
     total: str
-    chemist_id: int
-    chemist_name: str
-    eta_minutes: int
+    feasible: bool
+    candidate_count: int
+    eta_minutes_low: int
+    eta_minutes_high: int
     promise_minutes: int
     requires_prescription: bool
     requires_pharmacist_verification: bool
@@ -77,6 +85,9 @@ class OrderOut(BaseModel):
     prescription_gate: str
     chemist_id: int | None
     chemist_name: str | None
+    urgency: str
+    sourcing_attempts: int
+    committed_eta_minutes: int | None
     items: list[OrderItemOut]
     total: str
     promise_minutes: int
@@ -131,6 +142,56 @@ class StockIn(BaseModel):
 
 class DispatchIn(BaseModel):
     rider: str = Field(min_length=1)
+
+
+class OfferOut(BaseModel):
+    offer_id: int
+    order_id: int
+    chemist_id: int
+    attempt_seq: int
+    state: str
+    eta_minutes: int
+    expires_in_seconds: int
+
+
+class CourierOfferOut(BaseModel):
+    offer_id: int
+    order_id: int
+    chemist_name: str
+    chemist_lat: float
+    chemist_lng: float
+    patient_zone: str
+    pickup_km: float
+    expires_in_seconds: int
+    carries_scheduled_goods: bool
+    urgency: str
+    fee: str
+
+
+class StopOut(BaseModel):
+    stop_id: int
+    order_id: int
+    kind: str
+    state: str
+    sequence: int
+    lat: float
+    lng: float
+    label: str
+    carries_scheduled_goods: bool
+
+
+class CourierOut(BaseModel):
+    id: int
+    name: str
+    state: str
+    vehicle: str
+    can_cold_chain: bool
+    orders_in_custody: list[int]
+
+
+class PositionIn(BaseModel):
+    lat: float
+    lng: float
 
 
 class EconomicsOut(BaseModel):

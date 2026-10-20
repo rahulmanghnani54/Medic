@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Courier app</title>
+<link rel="icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="header"></div>
+<main>
+  <div id="banner"></div>
+
+  <section>
+    <h2>Shift</h2>
+    <div class="row">
+      <div>
+        <label for="courier">Rider</label>
+        <select id="courier"></select>
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="online" class="secondary">Go on shift</button>
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="offline" class="secondary">End shift</button>
+      </div>
+    </div>
+    <div id="state" class="flex" style="margin-top:10px"></div>
+    <div id="custody" style="margin-top:10px"></div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label for="zone">Where you are</label>
+        <select id="zone"></select>
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="report" class="secondary">Report position</button>
+      </div>
+    </div>
+    <p class="note">
+      Dispatch only reaches riders whose position it knows, so send one at the start of a
+      shift. The pilot has no phone GPS feed: pick the zone you are in instead.
+    </p>
+  </section>
+
+  <section>
+    <h2>Offers</h2>
+    <div id="offers"><p class="empty">Nothing offered right now.</p></div>
+  </section>
+
+  <section>
+    <h2>Your run</h2>
+    <div id="plan"><p class="empty">No stops. Accept an offer to start a run.</p></div>
+  </section>
+</main>
+
+<script type="module">
+import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+
+// The pilot's seeded riders. A real app never offers this choice: the courier's
+// identity comes from the logged-in session, because the H1 register has to record
+// WHICH rider took custody of a package and a picker cannot be evidence of that.
+const COURIER_IDS = [1, 2, 3, 4];
+
+// Jaipur pilot zones, standing in for a phone's GPS stream.
+const ZONES = [
+  ['Malviya Nagar', 26.8505, 75.8060],
+  ['Vaishali Nagar', 26.9124, 75.7400],
+  ['Mansarovar', 26.8520, 75.7640],
+  ['C-Scheme', 26.9065, 75.7985],
+  ['Raja Park', 26.8955, 75.8280],
+];
+
+const POLL_MS = 4000;
+
+// Off shift reads as a problem rather than as neutral: a rider who believes they
+// are online but is not simply never gets offered anything, and waits all evening.
+const SHIFT_PILL = { IDLE: 'ok', ON_PLAN: 'ok', UNASSIGNABLE: 'wait', OFFLINE: 'bad' };
+
+const URGENCY_PILL = { CRITICAL: 'bad', TIME_SENSITIVE: 'wait', ROUTINE: 'ok', ELECTIVE: 'ok' };
+
+const $ = (id) => document.getElementById(id);
+document.getElementById('header').replaceWith(pageHeader('Courier app', 'courier'));
+for (const id of COURIER_IDS) {
+  $('courier').append(el('option', { value: id, text: `Courier ${id}` }));
+}
+ZONES.forEach(([name], index) => $('zone').append(el('option', { value: index, text: name })));
+
+const courierId = () => Number($('courier').value);
+
+let shiftState = null;
+let lastPosition = null;
+let offersLoaded = false;
+let planLoaded = false;
+//: offer_id -> local expiry timestamp, fixed on first sight (see countdownPill).
+const deadlines = new Map();
+
+// Riders authenticate per person, not by role, so api.js has no shared courier
+// token to hand out. Writing the picked rider's dev token where tokenFor() looks
+// keeps this console on the one auth path instead of growing a second one.
+function useCourierToken() {
+  try {
+    localStorage.setItem('medic.token.courier', `dev-courier-${courierId()}`);
+  } catch { /* no storage: the request goes out unauthenticated and the API says so */ }
+}
+
+function renderShift() {
+  $('state').replaceChildren(
+    shiftState
+      ? el('span', {
+          class: `pill ${SHIFT_PILL[shiftState] || 'wait'}`,
+          text: shiftState.replaceAll('_', ' ').toLowerCase(),
+        })
+      : el('span', { class: 'pill wait', text: 'shift not started from this device' }),
+    el('span', {
+      class: 'note', style: 'margin:0',
+      text: lastPosition ? `position sent from ${lastPosition}` : 'no position sent yet',
+    }),
+  );
+}
+
+async function setShift(action, button) {
+  clearBanner($('banner'));
+  button.disabled = true;
+  try {
+    const path = `/api/courier/${courierId()}/${action}`;
+    const courier = await api('courier', path, { method: 'POST' });
+    shiftState = courier?.state || (action === 'online' ? 'IDLE' : 'OFFLINE');
+    $('custody').replaceChildren();
+    renderShift();
+    await refresh();
+  } catch (err) {
+    // A 409 here means the rider is still holding dispensed goods. That is a custody
+    // rule with a pharmacy register behind it, not a glitch to retry past, so it stays
+    // on screen beside the button that was pressed rather than scrolling away.
+    if (err.status === 409) {
+      $('custody').replaceChildren(el('div', { class: 'banner err' },
+        err.message,
+        el('p', { class: 'note', style: 'margin:6px 0 0; color:inherit' },
+          'Hand the package over, or take it back to the chemist, before ending the shift.')));
+    }
+    banner($('banner'), 'err', err.message);
+    renderShift();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function reportPosition() {
+  const [name, lat, lng] = ZONES[Number($('zone').value)];
+  clearBanner($('banner'));
+  try {
+    await api('courier', `/api/courier/${courierId()}/position`, {
+      method: 'POST', body: { lat, lng },
+    });
+    lastPosition = name;
+    renderShift();
+    await refresh();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function secondsLeft(offerId) {
+  const at = deadlines.get(offerId);
+  return at === undefined ? null : Math.max(0, Math.round((at - Date.now()) / 1000));
+}
+
+function countdownPill(offerId) {
+  const left = secondsLeft(offerId);
+  return el('span', {
+    class: `pill ${left === 0 ? 'bad' : left <= 10 ? 'wait' : 'ok'}`,
+    'data-countdown': offerId,
+    text: left === 0 ? 'expired' : `${left}s left`,
+  });
+}
+
+// Navigation is a link, not a map SDK: a rider already has a maps app, and shipping
+// one here would mean a tile key and a build step for no extra information.
+const mapsLink = (lat, lng) =>
+  el('a', {
+    class: 'note', style: 'margin:0', target: '_blank', rel: 'noreferrer', text: 'open in maps',
+    href: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+  });
+
+// `carries_scheduled_goods` is set from the register-entry rule, which on this
+// platform only ever means Schedule H1 — Schedule X is not dispensable online.
+const scheduledPill = () => schedulePill('H1');
+
+function offerCard(offer) {
+  return el('div', { class: 'stat' },
+    el('div', { class: 'flex' },
+      el('strong', { text: `Order #${offer.order_id}` }),
+      countdownPill(offer.offer_id),
+      el('span', {
+        class: `pill ${URGENCY_PILL[offer.urgency] || 'wait'}`,
+        text: String(offer.urgency).replaceAll('_', ' ').toLowerCase(),
+      }),
+      offer.carries_scheduled_goods ? scheduledPill() : null,
+      el('strong', { style: 'margin-left:auto', text: `₹${offer.fee}` })),
+    el('p', { class: 'note' },
+      `Collect from ${offer.chemist_name} · ${Number(offer.pickup_km).toFixed(1)} km away`,
+      ` · deliver to ${offer.patient_zone} · `,
+      mapsLink(offer.chemist_lat, offer.chemist_lng)),
+    offer.carries_scheduled_goods
+      ? el('div', { class: 'banner info', style: 'margin:0 0 10px' },
+          'Schedule H1 package: the chemist records your name on the register when you '
+          + 'collect it, and you cannot end your shift while you are carrying it.')
+      : null,
+    el('div', { class: 'flex' },
+      el('button', {
+        'data-accept': offer.offer_id, style: 'flex:1 1 auto',
+        onclick: () => accept(offer.offer_id),
+      }, 'Accept'),
+      el('button', {
+        class: 'secondary', style: 'flex:1 1 auto', onclick: () => decline(offer.offer_id),
+      }, 'Decline')),
+  );
+}
+
+function stopCard(stop, next) {
+  const isNext = next !== null && stop.stop_id === next.stop_id;
+  const done = stop.state === 'DONE';
+  const collect = stop.kind === 'COLLECT';
+  return el('div', {
+    class: 'stat',
+    style: isNext ? 'border-color:var(--accent); border-left-width:4px'
+      : done ? 'opacity:.55' : null,
+  },
+  el('div', { class: 'flex' },
+    el('strong', {
+      text: `${stop.sequence}. ${collect ? 'Collect' : 'Hand over'} — order #${stop.order_id}`,
+    }),
+    // statusPill knows no stop states, and its fallback reads as "waiting" — right
+    // for a stop still ahead of the rider, wrong for one already finished.
+    done ? el('span', { class: 'pill ok', text: 'done' }) : statusPill(stop.state),
+    stop.carries_scheduled_goods ? scheduledPill() : null,
+    isNext ? el('span', { class: 'pill ok', text: 'next stop' }) : null),
+  el('p', { class: 'note' }, stop.label, ' · ', mapsLink(stop.lat, stop.lng)),
+  stop.carries_scheduled_goods && !done
+    ? el('div', { class: 'banner info', style: 'margin:0 0 10px' },
+        collect
+          ? 'Schedule H1: completing this stop is the dispensing event and puts the '
+            + 'package on the register against your name.'
+          : 'Schedule H1: hand this to the patient in person. Until you do, custody is '
+            + 'yours and the shift cannot be ended.')
+    : null,
+  isNext
+    ? el('div', { class: 'flex' },
+        stop.state === 'PLANNED'
+          ? el('button', {
+              class: 'secondary', style: 'flex:1 1 auto', onclick: () => arrive(stop.stop_id),
+            }, 'I have arrived')
+          : null,
+        el('button', { style: 'flex:1 1 auto', onclick: () => complete(stop.stop_id) },
+          collect ? 'Collect from chemist' : 'Hand over to patient'))
+    : null,
+  );
+}
+
+async function loadOffers() {
+  try {
+    const offers = await api('courier', `/api/courier/${courierId()}/offers`);
+    const open = new Set(offers.map((offer) => offer.offer_id));
+    for (const id of [...deadlines.keys()]) if (!open.has(id)) deadlines.delete(id);
+    // The deadline is pinned the first time an offer is seen, so the countdown runs
+    // smoothly instead of jumping back a second or two on every poll.
+    for (const offer of offers) {
+      if (!deadlines.has(offer.offer_id)) {
+        deadlines.set(offer.offer_id, Date.now() + offer.expires_in_seconds * 1000);
+      }
+    }
+    offersLoaded = true;
+    $('offers').replaceChildren(offers.length
+      ? el('div', { class: 'stack' }, offers.map(offerCard))
+      : el('p', { class: 'empty', text: 'Nothing offered right now.' }));
+  } catch {
+    // A failed poll is not news worth a banner: keep the last good screen and retry.
+    if (!offersLoaded) {
+      $('offers').replaceChildren(
+        el('p', { class: 'empty', text: 'Offers unavailable. Retrying.' }));
+    }
+  }
+}
+
+async function loadPlan() {
+  try {
+    const stops = await api('courier', `/api/courier/${courierId()}/plan`);
+    // The next stop comes from the plan's own sequence, never from a scalar state:
+    // a rider can be carrying one order while collecting another.
+    const openStops = stops.filter((stop) => stop.state === 'PLANNED' || stop.state === 'ARRIVED');
+    const next = openStops.length
+      ? openStops.reduce((a, b) => (a.sequence <= b.sequence ? a : b))
+      : null;
+    planLoaded = true;
+    $('plan').replaceChildren(stops.length
+      ? el('div', { class: 'stack' }, stops.map((stop) => stopCard(stop, next)))
+      : el('p', { class: 'empty', text: 'No stops. Accept an offer to start a run.' }));
+  } catch {
+    if (!planLoaded) {
+      $('plan').replaceChildren(el('p', { class: 'empty', text: 'Run unavailable. Retrying.' }));
+    }
+  }
+}
+
+const refresh = () => Promise.all([loadOffers(), loadPlan()]);
+
+async function accept(offerId) {
+  clearBanner($('banner'));
+  try {
+    await api('courier', `/api/courier/offers/${offerId}/accept`, { method: 'POST' });
+    deadlines.delete(offerId);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+  await refresh();
+}
+
+async function decline(offerId) {
+  const reason = prompt('Why are you passing on this one?', 'too far');
+  if (!reason) return;
+  clearBanner($('banner'));
+  try {
+    await api('courier', `/api/courier/offers/${offerId}/decline`, {
+      method: 'POST', body: { reason },
+    });
+    deadlines.delete(offerId);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+  await refresh();
+}
+
+async function arrive(stopId) {
+  clearBanner($('banner'));
+  try {
+    await api('courier', `/api/courier/stops/${stopId}/arrive`, { method: 'POST' });
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+  await refresh();
+}
+
+async function complete(stopId) {
+  clearBanner($('banner'));
+  try {
+    await api('courier', `/api/courier/stops/${stopId}/complete`, { method: 'POST' });
+    // The custody notice is stale the moment a stop completes: the goods just moved.
+    $('custody').replaceChildren();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+  await refresh();
+}
+
+// The window is 45 seconds, so a 4-second poll is far too coarse to count it down:
+// an offer the rider can no longer win must stop looking winnable.
+function tick() {
+  for (const node of document.querySelectorAll('[data-countdown]')) {
+    const left = secondsLeft(Number(node.dataset.countdown));
+    if (left === null) continue;
+    node.textContent = left === 0 ? 'expired' : `${left}s left`;
+    node.className = `pill ${left === 0 ? 'bad' : left <= 10 ? 'wait' : 'ok'}`;
+  }
+  for (const node of document.querySelectorAll('[data-accept]')) {
+    node.disabled = secondsLeft(Number(node.dataset.accept)) === 0;
+  }
+}
+
+$('courier').addEventListener('change', () => {
+  useCourierToken();
+  shiftState = null;
+  lastPosition = null;
+  offersLoaded = false;
+  planLoaded = false;
+  deadlines.clear();
+  clearBanner($('banner'));
+  $('custody').replaceChildren();
+  renderShift();
+  refresh();
+});
+$('online').addEventListener('click', (event) => setShift('online', event.target));
+$('offline').addEventListener('click', (event) => setShift('offline', event.target));
+$('report').addEventListener('click', reportPosition);
+
+useCourierToken();
+renderShift();
+refresh();
+setInterval(refresh, POLL_MS);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

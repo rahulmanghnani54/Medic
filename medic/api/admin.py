@@ -15,7 +15,10 @@ from medic.domain.orders import sla_view
 from medic.models import (
     AuditEvent,
     Chemist,
+    Courier,
     Medicine,
+    Offer,
+    OfferState,
     Order,
     OrderStatus,
     Prescription,
@@ -37,6 +40,7 @@ _pharmacist = require_role("pharmacist")
 _admin = require_role("admin")
 
 LIVE_STATUSES = (
+    OrderStatus.SEEKING_CHEMIST,
     OrderStatus.AWAITING_FULFILMENT,
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
@@ -227,6 +231,72 @@ def catalogue(
         }
         for m in rows
     ]
+
+
+@router.get("/dispatch")
+def dispatch_board(
+    session: Session = Depends(get_session),
+    _: str = _admin,
+) -> dict:
+    """The offer funnel: who was asked, what they said, and what is stranded.
+
+    This is the diagnostic the synchronous design could not produce. It used
+    to compute a ranked candidate list on every checkout and throw all of it
+    away except the winner, so a chemist who was never asked and a chemist
+    who refused looked identical afterwards.
+    """
+    now = datetime.now(UTC)
+    offers = session.scalars(select(Offer).order_by(Offer.id.desc()).limit(200)).all()
+    by_state: dict[str, int] = {}
+    declines: dict[str, int] = {}
+    for offer in offers:
+        by_state[str(offer.state)] = by_state.get(str(offer.state), 0) + 1
+        if offer.state is OfferState.DECLINED and offer.reason:
+            declines[offer.reason] = declines.get(offer.reason, 0) + 1
+
+    sourcing = session.scalars(
+        select(Order).where(Order.status == OrderStatus.SEEKING_CHEMIST)
+    ).all()
+    chemists = {c.id: c.name for c in session.scalars(select(Chemist))}
+    return {
+        "offers_by_state": by_state,
+        "decline_reasons": declines,
+        "open_offers": [
+            {
+                "offer_id": o.id,
+                "order_id": o.order_id,
+                "chemist": chemists.get(o.chemist_id, "?"),
+                "attempt": o.attempt_seq,
+                "eta_minutes": o.eta_minutes,
+                "expires_in_seconds": max(0, int((o.expires_at - now).total_seconds())),
+            }
+            for o in offers
+            if o.state is OfferState.OFFERED
+        ],
+        "seeking_chemist": [
+            {
+                "order_id": o.id,
+                "zone": o.delivery_zone,
+                "urgency": str(o.urgency),
+                "attempts": o.attempt_seq,
+                "minutes_remaining": sla_view(
+                    o.created_at, o.promised_minutes, now
+                ).minutes_remaining,
+            }
+            for o in sourcing
+        ],
+        "couriers": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "state": str(c.state),
+                "cold_chain": c.can_cold_chain,
+                "acceptance_rate": round(c.acceptance_rate, 2),
+                "deliveries": c.deliveries_completed,
+            }
+            for c in session.scalars(select(Courier).order_by(Courier.id))
+        ],
+    }
 
 
 @router.get("/audit")

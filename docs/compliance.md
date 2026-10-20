@@ -41,7 +41,43 @@ Design rules that follow from that table:
 - **Price ceilings bind automatically.** A DPCO/NPPA-capped item is priced at
   its ceiling without anyone having to remember; see `docs/economics.md`.
 - **Everything is audited.** `AuditEvent` is append-only and records actor,
-  action and subject for every state change.
+  action and subject for every state change, through one chokepoint.
+
+Added with the move to asynchronous dispatch, because each one closes a hole
+that the offer loop would otherwise have opened:
+
+- **One module owns the dispensing event.** `services/dispensing.py` writes the
+  register entry, debits the prescription and records custody, in one
+  transaction. Every path that moves goods -- the courier's collection, an
+  operator override -- goes through it. Separating physical collection from the
+  register write was the single most dangerous thing the rewrite could have
+  done.
+- **Dispensing is idempotent.** At-least-once workers make a replay a question
+  of when, not if, and a replayed dispense would duplicate a statutory register
+  row and double-debit a patient's authorisation. There is a uniqueness
+  constraint on `(order_id, medicine_id)` behind the state check.
+- **Custody is recorded for every order**, in `Order.dispensed_at`, not
+  inferred from the presence of a register row -- an OTC basket writes no
+  register row but is just as much out of the pharmacy's hands.
+- **Stock is leased, not decremented.** `qty_reserved` is separate from
+  `qty_on_hand`, and a lease is a row with a terminal state, so releasing twice
+  is a no-op. A double release of a decrement would inflate declared stock and
+  invent phantom units of a scheduled drug.
+- **Offers are sequential and hold a lease.** Broadcasting one order to several
+  chemists without a hold would let two of them accept against the same units.
+- **The prescription gate is final and cannot re-open.**
+  `assert_gate_transition` has no edge out of `CLEARED` or `FAILED` on the
+  prescription gate. Re-sourcing a chemist does not invalidate a verification,
+  and a rejection cannot be walked back by a later offer round.
+- **A rejected prescription stops the loop wherever the order has got to.**
+  The rejection hook covers `SEEKING_CHEMIST` as well as the later states,
+  supersedes any open offer and releases any lease. The dispatcher also
+  re-checks the prescription before every offer, as defence in depth.
+- **Couriers authenticate as individuals.** The register records who took
+  custody; a shared role token cannot answer that, so it would put an
+  unauthenticated name on a statutory record.
+- **A courier holding dispensed goods cannot go offline**, and custody is read
+  from the waypoint plan rather than the order's status column.
 
 ## Safeguards from the brief, and their current strength
 
@@ -52,6 +88,7 @@ Design rules that follow from that table:
 | Detect repeat uploads | **weak** | Exact SHA-256 match only. A re-photographed or lightly cropped image will not collide. Perceptual hashing or OCR is deliberately out of MVP scope. |
 | Show a "pharmacist verifying" step | done | Surfaced in the customer app and counted into the ETA. |
 | 24/7 pharmacist cover | **not built** | An operational commitment, not a code change. The queue exists; staffing it does not. |
+| Verification is never squeezed by the promise | done | The gates run concurrently, which is the permitted latency optimisation. When the budget cannot accommodate verification the order loses the 60-minute promise; the gate does not shorten. |
 
 ## Open questions for counsel
 
@@ -80,6 +117,16 @@ These block launch, not the build:
    criticism for the quick-commerce entrants.
 8. **Data protection.** Prescriptions are health data. Retention, access and
    breach obligations need to be specified before we hold real ones.
+9. **Who is the dispensing pharmacist of record under re-sourcing?** Every
+   re-offer moves the dispensing pharmacy, and therefore the registered
+   pharmacist on the register row, while the platform pharmacist who cleared
+   the verification stays the same. The offer loop multiplies this exposure by
+   the number of attempts. This needs an answer before launch.
+10. **May one prescription be dispensed across two pharmacies?** Basket
+    splitting is the largest remaining efficiency gain and is blocked on this.
+11. **Courier custody of scheduled drugs.** What record must a delivery partner
+    keep, what happens on a failed handover, and does returning goods to the
+    dispensing chemist need a reversal entry the register has no concept of?
 
 ## Known engineering gaps
 
@@ -98,5 +145,18 @@ Deliberate MVP limitations, listed so nobody mistakes them for finished work:
   the admin console.
 - **Distances are straight-line** with a 1.4× road factor, not routed.
 - **Single-chemist fulfilment only.** A basket no one chemist can fill is
-  refused; splitting across two is not implemented.
-- **No notifications.** No SMS or push at any step.
+  refused; splitting across two is not implemented, and is blocked on open
+  question 10 in any case.
+- **No notifications.** No SMS or push at any step. This matters more than it
+  did: a checkout refusal used to be a synchronous HTTP error the patient saw
+  immediately, and "no chemist could be found" is now an outcome that can land
+  minutes later with nothing to deliver it. The honest-refusal argument only
+  holds if the refusal actually reaches the patient in time for them to walk to
+  a pharmacy.
+- **No courier batching**, no multi-order runs, and no pay structure to make a
+  courier accept one.
+- **Cold-chain capability is a static boolean**, self-declared and never
+  re-verified, while being used as a hard safety filter. It should be a
+  recurring inspection credential like the others.
+- **No appeal path** against a routing-weight demotion, which is a
+  commercially material adverse action.

@@ -16,14 +16,24 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from medic.api import admin, chemist, customer
+from medic.api import admin, chemist, courier, customer
 from medic.config import settings
 from medic.db import create_all
-from medic.domain.orders import IllegalTransition
+from medic.domain.couriers import (
+    CustodyHeld,
+    IllegalCourierTransition,
+    IllegalStopTransition,
+)
+from medic.domain.dispatch import IllegalOfferTransition
+from medic.domain.orders import IllegalGateTransition, IllegalTransition, SourcingExhausted
 from medic.domain.prescriptions import PrescriptionProblem
 from medic.domain.pricing import CommissionOutOfBand, PriceCapBreach
 from medic.domain.schedules import NotDispensableOnline
+from medic.services.couriers import CourierError
+from medic.services.dispatching import DispatchError
+from medic.services.dispensing import DispensingRefused
 from medic.services.ordering import OrderingError
+from medic.services.stock import InsufficientStock
 
 log = logging.getLogger("medic")
 
@@ -86,9 +96,62 @@ def handle_ordering(_: Request, exc: OrderingError) -> JSONResponse:
     return _problem(400, str(exc), "ordering_error")
 
 
+@app.exception_handler(DispatchError)
+def handle_dispatch(_: Request, exc: DispatchError) -> JSONResponse:
+    return _problem(409, str(exc), "dispatch_error")
+
+
+@app.exception_handler(CourierError)
+def handle_courier(_: Request, exc: CourierError) -> JSONResponse:
+    return _problem(409, str(exc), "courier_error")
+
+
+@app.exception_handler(CustodyHeld)
+def handle_custody(_: Request, exc: CustodyHeld) -> JSONResponse:
+    # A courier holding dispensed goods cannot be released. This is a custody
+    # rule, so it is a conflict with the current state, not a bad request.
+    return _problem(409, str(exc), "custody_held")
+
+
+@app.exception_handler(DispensingRefused)
+def handle_dispensing(_: Request, exc: DispensingRefused) -> JSONResponse:
+    return _problem(409, str(exc), "dispensing_refused")
+
+
+@app.exception_handler(InsufficientStock)
+def handle_stock(_: Request, exc: InsufficientStock) -> JSONResponse:
+    return _problem(409, str(exc), "insufficient_stock")
+
+
+@app.exception_handler(IllegalOfferTransition)
+def handle_offer_transition(_: Request, exc: IllegalOfferTransition) -> JSONResponse:
+    return _problem(409, str(exc), "illegal_offer_transition")
+
+
+@app.exception_handler(IllegalGateTransition)
+def handle_gate_transition(_: Request, exc: IllegalGateTransition) -> JSONResponse:
+    return _problem(409, str(exc), "illegal_gate_transition")
+
+
+@app.exception_handler(IllegalCourierTransition)
+def handle_courier_transition(_: Request, exc: IllegalCourierTransition) -> JSONResponse:
+    return _problem(409, str(exc), "illegal_courier_transition")
+
+
+@app.exception_handler(IllegalStopTransition)
+def handle_stop_transition(_: Request, exc: IllegalStopTransition) -> JSONResponse:
+    return _problem(409, str(exc), "illegal_stop_transition")
+
+
+@app.exception_handler(SourcingExhausted)
+def handle_sourcing_exhausted(_: Request, exc: SourcingExhausted) -> JSONResponse:
+    return _problem(409, str(exc), "sourcing_exhausted")
+
+
 app.include_router(customer.router)
 app.include_router(chemist.router)
 app.include_router(admin.router)
+app.include_router(courier.router)
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -101,7 +164,7 @@ def index() -> FileResponse:
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
 
 
-for console in ("customer", "chemist", "admin"):
+for console in ("customer", "chemist", "admin", "courier"):
     app.mount(
         f"/{console}",
         StaticFiles(directory=os.path.join(WEB_DIR, console), html=True),

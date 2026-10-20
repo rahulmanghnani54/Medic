@@ -5,3 +5,4 @@ pydantic==2.12.4
 # Required by FastAPI to parse multipart form data (prescription uploads).
 # Not imported directly.
 python-multipart==0.0.20
+h3==4.5.0

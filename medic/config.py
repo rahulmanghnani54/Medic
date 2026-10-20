@@ -25,7 +25,35 @@ class Settings:
     chemist_prep_minutes: int = 12
     rider_speed_kmph: float = 18.0
     rider_pickup_buffer_minutes: int = 8
+    # How long a chemist has to answer an offer before it expires and the
+    # order is re-offered to the next candidate.
     chemist_accept_window_minutes: int = 5
+    # Hard bound on the re-offer cycle for one order.
+    max_sourcing_attempts: int = 4
+    # How long a courier has to answer a delivery offer.
+    courier_offer_window_seconds: int = 45
+    max_courier_offer_attempts: int = 5
+    # A courier will not be sent further than this to reach a chemist. Uber's
+    # "wild goose chase": under excess demand a matcher that keeps reaching
+    # further turns pickup time into deadweight and throughput collapses.
+    max_courier_pickup_km: float = 4.0
+
+    # --- Geospatial index (Uber's H3) ---------------------------------
+    # res 8 cells are ~0.75 km2 with a ~530 m edge: the right grain for
+    # dispatch in Jaipur. res 7 (~5.2 km2) is the zoning/aggregation grain.
+    h3_dispatch_resolution: int = 8
+    h3_zone_resolution: int = 7
+    # Rings of neighbours to sweep outward when looking for supply.
+    h3_max_ring: int = 8
+
+    # --- Readiness prediction -----------------------------------------
+    # Fallback prep estimate before a chemist has any history.
+    default_chemist_prep_minutes: int = 12
+    # Per pharmacist, per order in the queue ahead of this one.
+    verification_minutes_per_queued_order: int = 3
+    # How long a courier is asked to arrive before predicted ready_at. Tuned
+    # so the courier waits a little rather than the package waiting a lot.
+    courier_early_arrival_minutes: int = 3
 
     # --- Commercials (all money in paise) --------------------------------
     commission_bps_min: int = 800   # 8%  -- brief: take rate band to test

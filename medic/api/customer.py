@@ -44,9 +44,12 @@ def quote(
     session: Session = Depends(get_session),
     _: str = _auth,
 ) -> QuoteOut:
-    quote = ordering.quote_order(
+    """Price the basket and say whether anyone can fill it -- naming nobody."""
+    priced, totals = ordering.price_basket(
+        session, lines=[ordering.LineRequest(line.medicine_id, line.qty) for line in body.lines]
+    )
+    verdict = ordering.assess_feasibility(
         session,
-        customer_id=body.customer_id,
         lines=[ordering.LineRequest(line.medicine_id, line.qty) for line in body.lines],
         delivery_lat=body.delivery_lat,
         delivery_lng=body.delivery_lng,
@@ -61,18 +64,19 @@ def quote(
                 mrp=rupees_out(line.mrp_paise),
                 line_total=rupees_out(line.line_total_paise),
             )
-            for line in quote.lines
+            for line in priced
         ],
-        subtotal=rupees_out(quote.totals.subtotal_paise),
-        chemist_funded_discount=rupees_out(quote.totals.chemist_funded_discount_paise),
-        delivery_fee=rupees_out(quote.totals.delivery_fee_paise),
-        total=rupees_out(quote.totals.total_paise),
-        chemist_id=quote.chemist_id,
-        chemist_name=quote.chemist_name,
-        eta_minutes=quote.eta.total_minutes,
-        promise_minutes=quote.promise_minutes,
-        requires_prescription=quote.requires_prescription,
-        requires_pharmacist_verification=quote.requires_verification,
+        subtotal=rupees_out(totals.subtotal_paise),
+        chemist_funded_discount=rupees_out(totals.chemist_funded_discount_paise),
+        delivery_fee=rupees_out(totals.delivery_fee_paise),
+        total=rupees_out(totals.total_paise),
+        feasible=verdict.feasible,
+        candidate_count=verdict.candidate_count,
+        eta_minutes_low=verdict.eta_minutes_low,
+        eta_minutes_high=verdict.eta_minutes_high,
+        promise_minutes=verdict.promise_minutes,
+        requires_prescription=verdict.requires_prescription,
+        requires_pharmacist_verification=verdict.requires_verification,
     )
 
 

@@ -23,6 +23,17 @@
   </section>
 
   <section>
+    <h2>Dispatch funnel</h2>
+    <p class="note">
+      Who was asked, what they said, and what is still looking. The synchronous
+      design could not show this: it ranked every candidate on each checkout and
+      discarded all but the winner, so a chemist never asked and a chemist who
+      refused looked identical afterwards.
+    </p>
+    <div id="dispatch"></div>
+  </section>
+
+  <section>
     <h2>Live orders against the 60-minute clock</h2>
     <div id="sla"><p class="empty">No live orders.</p></div>
   </section>
@@ -48,7 +59,8 @@
 </main>
 
 <script type="module">
-import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+import { api, el, banner, clearBanner, setChildren, statusPill, schedulePill, pageHeader }
+  from '/static/api.js';
 
 const $ = (id) => document.getElementById(id);
 document.getElementById('header').replaceWith(pageHeader('Pharmacist and ops console', 'pharmacist / admin'));
@@ -310,9 +322,76 @@ async function loadAudit() {
   }
 }
 
+async function loadDispatch() {
+  try {
+    const d = await api('admin', '/api/admin/dispatch');
+    const states = Object.entries(d.offers_by_state);
+    setChildren($('dispatch'),
+      el('div', { class: 'grid' },
+        ...states.map(([state, n]) => stat(state.toLowerCase().replaceAll('_', ' '), n))),
+      el('h3', { style: 'font-size:13px;margin:14px 0 6px', text: 'Open offers' }),
+      d.open_offers.length
+        ? el('table', {},
+            el('thead', {}, el('tr', {},
+              el('th', { text: 'Order' }), el('th', { text: 'Chemist' }),
+              el('th', { class: 'num', text: 'Attempt' }),
+              el('th', { class: 'num', text: 'ETA' }),
+              el('th', { class: 'num', text: 'Answer within' }))),
+            el('tbody', {}, d.open_offers.map((o) =>
+              el('tr', {},
+                el('td', { text: `#${o.order_id}` }),
+                el('td', { text: o.chemist }),
+                el('td', { class: 'num', text: o.attempt }),
+                el('td', { class: 'num', text: `${o.eta_minutes} min` }),
+                el('td', { class: 'num' },
+                  el('span', {
+                    class: `pill ${o.expires_in_seconds < 60 ? 'bad' : 'wait'}`,
+                    text: `${o.expires_in_seconds}s`,
+                  }))))))
+        : el('p', { class: 'empty', text: 'No offer is open.' }),
+      el('h3', { style: 'font-size:13px;margin:14px 0 6px', text: 'Still looking for a chemist' }),
+      d.seeking_chemist.length
+        ? el('table', {},
+            el('tbody', {}, d.seeking_chemist.map((o) =>
+              el('tr', {},
+                el('td', { text: `#${o.order_id}` }),
+                el('td', { text: o.zone }),
+                el('td', {}, el('span', { class: 'pill rx', text: o.urgency.toLowerCase() })),
+                el('td', { class: 'num', text: `${o.attempts} tried` }),
+                el('td', { class: 'num' },
+                  el('span', {
+                    class: `pill ${o.minutes_remaining <= 15 ? 'bad' : 'wait'}`,
+                    text: `${o.minutes_remaining} min`,
+                  }))))))
+        : el('p', { class: 'empty', text: 'Nothing waiting on sourcing.' }),
+      Object.keys(d.decline_reasons).length
+        ? el('p', { class: 'note',
+            text: 'Decline reasons: ' + Object.entries(d.decline_reasons)
+              .map(([r, n]) => `${r} (${n})`).join(', ') })
+        : null,
+
+      el('h3', { style: 'font-size:13px;margin:14px 0 6px', text: 'Couriers' }),
+      el('table', {},
+        el('tbody', {}, d.couriers.map((c) =>
+          el('tr', {},
+            el('td', { text: c.name }),
+            el('td', {}, el('span', {
+              class: `pill ${c.state === 'OFFLINE' ? 'bad' : c.state === 'IDLE' ? 'ok' : 'wait'}`,
+              text: c.state.toLowerCase().replaceAll('_', ' '),
+            })),
+            el('td', { text: c.cold_chain ? 'cold chain' : '' }),
+            el('td', { class: 'num', text: `${Math.round(c.acceptance_rate * 100)}% accept` }),
+            el('td', { class: 'num', text: `${c.deliveries} delivered` }))))),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
 function refresh() {
   clearBanner($('banner'));
   loadQueue();
+  loadDispatch();
   loadSla();
   loadEconomics();
   loadAudit();
@@ -320,7 +399,7 @@ function refresh() {
 
 refresh();
 loadCatalogue();
-setInterval(() => { loadQueue(); loadSla(); }, 8000);
+setInterval(() => { loadQueue(); loadDispatch(); loadSla(); }, 8000);
 </script>
 </body>
 </html>

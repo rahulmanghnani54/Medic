@@ -13,15 +13,18 @@ is a compliance failure, not a data-quality nit.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from medic.config import settings
+from medic.domain import geocells
 from medic.domain.money import rupees
 from medic.domain.schedules import DrugSchedule
-from medic.models import Chemist, ChemistStock, Customer, Medicine
+from medic.domain.triage import ClinicalUrgency
+from medic.models import Chemist, ChemistStock, Courier, Customer, Medicine
 
 # Approximate centres of the launch zones named in the brief.
 ZONES = {
@@ -33,36 +36,37 @@ ZONES = {
 }
 
 MEDICINES = [
-    # name, composition, maker, pack, form, schedule, mrp, dpco ceiling, chronic, cold chain
+    # name, composition, maker, pack, form, schedule, mrp, dpco ceiling, chronic, cold, urgency
     ("Metformin 500mg", "Metformin HCl 500mg", "Generic Pharma", "strip of 15", "tablet",
-     DrugSchedule.OTC, 42.0, 38.0, True, False),
+     DrugSchedule.OTC, 42.0, 38.0, True, False, ClinicalUrgency.ROUTINE),
     ("Telmisartan 40mg", "Telmisartan 40mg", "Generic Pharma", "strip of 15", "tablet",
-     DrugSchedule.OTC, 118.0, 105.0, True, False),
+     DrugSchedule.OTC, 118.0, 105.0, True, False, ClinicalUrgency.ROUTINE),
     ("Thyroxine 50mcg", "Levothyroxine 50mcg", "Generic Pharma", "strip of 30", "tablet",
-     DrugSchedule.OTC, 165.0, None, True, False),
+     DrugSchedule.OTC, 165.0, None, True, False, ClinicalUrgency.ROUTINE),
     ("Atorvastatin 10mg", "Atorvastatin 10mg", "Generic Pharma", "strip of 15", "tablet",
-     DrugSchedule.OTC, 96.0, 88.0, True, False),
+     DrugSchedule.OTC, 96.0, 88.0, True, False, ClinicalUrgency.ROUTINE),
     ("Paracetamol 650mg", "Paracetamol 650mg", "Generic Pharma", "strip of 15", "tablet",
-     DrugSchedule.OTC, 30.0, 28.0, False, False),
+     DrugSchedule.OTC, 30.0, 28.0, False, False, ClinicalUrgency.ELECTIVE),
     ("ORS Sachet", "Oral rehydration salts", "Generic Pharma", "sachet", "powder",
-     DrugSchedule.OTC, 22.0, None, False, False),
+     DrugSchedule.OTC, 22.0, None, False, False, ClinicalUrgency.TIME_SENSITIVE),
     ("Antacid Suspension", "Magnesium/aluminium hydroxide", "Generic Pharma", "170ml", "syrup",
-     DrugSchedule.OTC, 145.0, None, False, False),
+     DrugSchedule.OTC, 145.0, None, False, False, ClinicalUrgency.ELECTIVE),
     ("Cetirizine 10mg", "Cetirizine 10mg", "Generic Pharma", "strip of 10", "tablet",
-     DrugSchedule.H, 35.0, None, False, False),
+     DrugSchedule.H, 35.0, None, False, False, ClinicalUrgency.ELECTIVE),
     ("Pantoprazole 40mg", "Pantoprazole 40mg", "Generic Pharma", "strip of 15", "tablet",
-     DrugSchedule.H, 155.0, 140.0, False, False),
+     DrugSchedule.H, 155.0, 140.0, False, False, ClinicalUrgency.ROUTINE),
     ("Azithromycin 500mg", "Azithromycin 500mg", "Generic Pharma", "strip of 3", "tablet",
-     DrugSchedule.H1, 115.0, 102.0, False, False),
+     DrugSchedule.H1, 115.0, 102.0, False, False, ClinicalUrgency.TIME_SENSITIVE),
     ("Amoxicillin-Clav 625mg", "Amoxicillin 500mg + Clavulanic acid 125mg", "Generic Pharma",
-     "strip of 10", "tablet", DrugSchedule.H1, 240.0, 215.0, False, False),
+     "strip of 10", "tablet", DrugSchedule.H1, 240.0, 215.0, False, False,
+     ClinicalUrgency.TIME_SENSITIVE),
     ("Zolpidem 5mg", "Zolpidem tartrate 5mg", "Generic Pharma", "strip of 10", "tablet",
-     DrugSchedule.H1, 88.0, None, False, False),
+     DrugSchedule.H1, 88.0, None, False, False, ClinicalUrgency.ELECTIVE),
     ("Insulin Glargine 100IU", "Insulin glargine 100IU/ml", "Generic Pharma", "3ml pen",
-     "injection", DrugSchedule.H, 780.0, None, True, True),
+     "injection", DrugSchedule.H, 780.0, None, True, True, ClinicalUrgency.CRITICAL),
     # Present so the refusal path is exercised and visible in the catalogue console.
     ("Alprazolam 0.5mg", "Alprazolam 0.5mg", "Generic Pharma", "strip of 10", "tablet",
-     DrugSchedule.X, 65.0, None, False, False),
+     DrugSchedule.X, 65.0, None, False, False, ClinicalUrgency.ROUTINE),
 ]
 
 CHEMISTS = [
@@ -79,6 +83,17 @@ CHEMISTS = [
      "+919800000105", False, 8, 21, 800, False),
 ]
 
+# Couriers carry a per-person token, not a shared role token: the register
+# has to record WHICH courier took custody of a Schedule H1 package, and a
+# shared secret cannot answer that. Hashed, as a real deployment would.
+COURIERS = [
+    # name, phone, dev token, vehicle, cold chain
+    ("Ramesh Yadav", "+919700000201", "dev-courier-1", "two-wheeler", True),
+    ("Sunita Rathore", "+919700000202", "dev-courier-2", "two-wheeler", False),
+    ("Arif Khan", "+919700000203", "dev-courier-3", "two-wheeler", False),
+    ("Deepak Saini", "+919700000204", "dev-courier-4", "bicycle", False),
+]
+
 CUSTOMERS = [
     ("Anita Verma", "+919812345678", "Malviya Nagar"),
     ("Mahesh Gupta", "+919812345679", "Mansarovar"),
@@ -89,7 +104,7 @@ CUSTOMERS = [
 def seed(session: Session, *, reset: bool = False) -> dict[str, int]:
     """Idempotent seed. Safe to call on an existing database."""
     if reset:
-        for model in (ChemistStock, Chemist, Medicine, Customer):
+        for model in (ChemistStock, Chemist, Medicine, Customer, Courier):
             session.query(model).delete()
         session.flush()
 
@@ -98,7 +113,7 @@ def seed(session: Session, *, reset: bool = False) -> dict[str, int]:
 
     medicines: list[Medicine] = []
     for (
-        name, composition, maker, pack, form, schedule, mrp, ceiling, chronic, cold
+        name, composition, maker, pack, form, schedule, mrp, ceiling, chronic, cold, urgency
     ) in MEDICINES:
         medicine = Medicine(
             name=name,
@@ -111,6 +126,7 @@ def seed(session: Session, *, reset: bool = False) -> dict[str, int]:
             dpco_ceiling_paise=rupees(ceiling) if ceiling else None,
             requires_cold_chain=cold,
             is_chronic_care=chronic,
+            urgency=urgency,
         )
         session.add(medicine)
         medicines.append(medicine)
@@ -139,6 +155,22 @@ def seed(session: Session, *, reset: bool = False) -> dict[str, int]:
         )
         session.add(chemist)
         chemists.append(chemist)
+
+    for name, phone, token, vehicle, cold in COURIERS:
+        lat, lng = ZONES["Malviya Nagar"]
+        session.add(
+            Courier(
+                name=name,
+                phone=phone,
+                token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+                vehicle=vehicle,
+                can_cold_chain=cold,
+                is_active=True,
+                last_lat=lat,
+                last_lng=lng,
+                last_cell=geocells.cell_for(lat, lng),
+            )
+        )
 
     for name, phone, zone in CUSTOMERS:
         lat, lng = ZONES[zone]
@@ -180,6 +212,7 @@ def seed(session: Session, *, reset: bool = False) -> dict[str, int]:
         "medicines": len(medicines),
         "chemists": len(chemists),
         "customers": len(CUSTOMERS),
+        "couriers": len(COURIERS),
         "stock": stock_rows,
         "skipped": 0,
     }

@@ -93,6 +93,64 @@ def is_open_at(candidate: ChemistCandidate, at: datetime) -> bool:
     return hour >= candidate.opens_hour_ist or hour < candidate.closes_hour_ist
 
 
+@dataclass(frozen=True)
+class Admission:
+    """Whether one chemist may serve one basket right now, and why not."""
+
+    ok: bool
+    reason: str = ""
+    eta: EtaBreakdown | None = None
+    distance_km: float | None = None
+
+
+def admits(
+    candidate: ChemistCandidate,
+    *,
+    delivery_lat: float,
+    delivery_lng: float,
+    needs_cold_chain: bool,
+    needs_verification: bool,
+    at: datetime,
+    budget_minutes: int | None = None,
+    config: Settings = settings,
+) -> Admission:
+    """The hard-filter chain, in order, as one reusable predicate.
+
+    Extracted so that the matcher and the offer-accept path cannot drift. An
+    offer may sit open for minutes before a chemist answers, and in that time
+    a licence can lapse, the shop can close, or the delivery budget can run
+    down -- so accept has to re-run exactly these checks, in exactly this
+    order, rather than a hand-copied subset of them.
+
+    `budget_minutes` is what remains of the 60 minutes, not the whole promise.
+    Passing None keeps the original behaviour of checking against the full
+    window, which is only correct for the first attempt.
+    """
+    if not candidate.is_active:
+        return Admission(False, "inactive")
+    if candidate.licence_expires_on is not None and candidate.licence_expires_on <= at:
+        return Admission(False, "drug licence expired")
+    if not is_open_at(candidate, at):
+        return Admission(False, "closed at this hour")
+    if needs_cold_chain and not candidate.can_cold_chain:
+        return Admission(False, "no cold chain")
+
+    distance = haversine_km(delivery_lat, delivery_lng, candidate.lat, candidate.lng)
+    if distance > config.max_match_radius_km:
+        return Admission(False, f"{distance:.1f} km away, outside radius")
+
+    eta = estimate_eta(distance, requires_verification=needs_verification, config=config)
+    if budget_minutes is None:
+        if not promise_is_feasible(eta, config):
+            return Admission(False, f"ETA {eta.total_minutes} min leaves no margin")
+    elif eta.total_minutes + config.sla_feasibility_margin_minutes > budget_minutes:
+        return Admission(
+            False,
+            f"ETA {eta.total_minutes} min does not fit the {budget_minutes} min left",
+        )
+    return Admission(True, eta=eta, distance_km=distance)
+
+
 def find_matches(
     basket: list[BasketLine],
     *,
@@ -100,6 +158,8 @@ def find_matches(
     delivery_lng: float,
     candidates: list[ChemistCandidate],
     at: datetime,
+    exclude_chemist_ids: frozenset[int] | set[int] | None = None,
+    budget_minutes: int | None = None,
     config: Settings = settings,
 ) -> Matching:
     if not basket:
@@ -123,30 +183,28 @@ def find_matches(
     full: list[MatchResult] = []
     partial: list[MatchResult] = []
     rejected: list[tuple[str, str]] = []
+    excluded = exclude_chemist_ids or frozenset()
 
     for candidate in candidates:
-        if not candidate.is_active:
-            rejected.append((candidate.name, "inactive"))
-            continue
-        if candidate.licence_expires_on is not None and candidate.licence_expires_on <= at:
-            rejected.append((candidate.name, "drug licence expired"))
-            continue
-        if not is_open_at(candidate, at):
-            rejected.append((candidate.name, "closed at this hour"))
-            continue
-        if needs_cold_chain and not candidate.can_cold_chain:
-            rejected.append((candidate.name, "no cold chain"))
+        if candidate.chemist_id in excluded:
+            rejected.append((candidate.name, "already tried for this order"))
             continue
 
-        distance = haversine_km(delivery_lat, delivery_lng, candidate.lat, candidate.lng)
-        if distance > config.max_match_radius_km:
-            rejected.append((candidate.name, f"{distance:.1f} km away, outside radius"))
+        verdict = admits(
+            candidate,
+            delivery_lat=delivery_lat,
+            delivery_lng=delivery_lng,
+            needs_cold_chain=needs_cold_chain,
+            needs_verification=needs_verification,
+            at=at,
+            budget_minutes=budget_minutes,
+            config=config,
+        )
+        if not verdict.ok:
+            rejected.append((candidate.name, verdict.reason))
             continue
-
-        eta = estimate_eta(distance, requires_verification=needs_verification, config=config)
-        if not promise_is_feasible(eta, config):
-            rejected.append((candidate.name, f"ETA {eta.total_minutes} min leaves no margin"))
-            continue
+        eta = verdict.eta
+        assert eta is not None
 
         missing = tuple(
             line.medicine_name

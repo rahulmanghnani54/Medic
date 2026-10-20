@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -13,9 +14,9 @@ from sqlalchemy.orm import Session
 from medic.api.presenters import order_out
 from medic.auth import require_role
 from medic.db import get_session
-from medic.models import Chemist, ChemistStock, Medicine, RegisterEntry
-from medic.schemas import ChemistRejectIn, OrderOut, StockIn
-from medic.services import ordering
+from medic.models import Chemist, ChemistStock, Medicine, Offer, OfferState, RegisterEntry
+from medic.schemas import ChemistRejectIn, OfferOut, OrderOut, StockIn
+from medic.services import dispatching, ordering
 
 router = APIRouter(prefix="/api/chemist", tags=["chemist"])
 _auth = require_role("chemist")
@@ -38,32 +39,79 @@ def queue(
     return [order_out(session, order) for order in ordering.chemist_queue(session, chemist_id)]
 
 
-@router.post("/{chemist_id}/orders/{order_id}/accept", response_model=OrderOut)
-def accept(
+@router.get("/{chemist_id}/offers", response_model=list[OfferOut])
+def offers(
     chemist_id: int,
-    order_id: int,
+    session: Session = Depends(get_session),
+    _: str = _auth,
+) -> list[OfferOut]:
+    """Open offers waiting on this chemist, with their countdown."""
+    _chemist_or_404(session, chemist_id)
+    now = datetime.now(UTC)
+    rows = session.scalars(
+        select(Offer).where(
+            Offer.chemist_id == chemist_id, Offer.state == OfferState.OFFERED
+        )
+    ).all()
+    return [
+        OfferOut(
+            offer_id=o.id,
+            order_id=o.order_id,
+            chemist_id=o.chemist_id,
+            attempt_seq=o.attempt_seq,
+            state=str(o.state),
+            eta_minutes=o.eta_minutes,
+            expires_in_seconds=max(0, int((o.expires_at - now).total_seconds())),
+        )
+        for o in rows
+    ]
+
+
+@router.post("/offers/{offer_id}/accept", response_model=OrderOut)
+def accept(
+    offer_id: int,
+    chemist_id: int,
     session: Session = Depends(get_session),
     _: str = _auth,
 ) -> OrderOut:
-    order = ordering.chemist_accept(session, order_id=order_id, chemist_id=chemist_id)
+    """Accept an OFFER, not an order id.
+
+    Keying on the offer is what makes acceptance authorised: previously any
+    chemist who could guess an order id could accept it.
+    """
+    order = dispatching.accept_offer(session, offer_id=offer_id, chemist_id=chemist_id)
     return order_out(session, order)
 
 
-@router.post("/{chemist_id}/orders/{order_id}/reject", response_model=OrderOut)
-def reject(
+@router.post("/offers/{offer_id}/decline", response_model=OrderOut)
+def decline(
+    offer_id: int,
+    chemist_id: int,
+    body: ChemistRejectIn,
+    session: Session = Depends(get_session),
+    _: str = _auth,
+) -> OrderOut:
+    """Pass on an offer. The order goes back to sourcing; it does not die."""
+    order = dispatching.decline_offer(
+        session, offer_id=offer_id, chemist_id=chemist_id, reason=body.reason
+    )
+    dispatching.advance_sourcing(session, order_id=order.id)
+    return order_out(session, order)
+
+
+@router.post("/{chemist_id}/orders/{order_id}/withdraw", response_model=OrderOut)
+def withdraw(
     chemist_id: int,
     order_id: int,
     body: ChemistRejectIn,
     session: Session = Depends(get_session),
     _: str = _auth,
 ) -> OrderOut:
-    order = ordering.chemist_reject(
-        session,
-        order_id=order_id,
-        chemist_id=chemist_id,
-        reason=body.reason,
-        stock_out=body.stock_out,
+    """Accepted, then found the shelf empty. Hand it back for re-sourcing."""
+    order = dispatching.withdraw_after_accept(
+        session, order_id=order_id, chemist_id=chemist_id, reason=body.reason
     )
+    dispatching.advance_sourcing(session, order_id=order_id)
     return order_out(session, order)
 
 

@@ -1,8 +1,13 @@
 """Order orchestration.
 
-The domain modules hold the rules; this module applies them to the database and
-writes the audit trail. API handlers stay thin so that the tests can drive the
-whole lifecycle without going through HTTP.
+The domain modules hold the rules; this module applies them to the database.
+Since the move to an Uber-style dispatch loop it no longer chooses a chemist:
+`place_order` prices the basket, checks that somebody could fill it, and hands
+the order to `services.dispatching`, which offers it to candidates in turn.
+
+What stayed here is the demand side -- catalogue, prescriptions, pricing,
+cancellation -- plus thin delegations kept so existing callers and the admin
+console do not have to know where the work moved.
 """
 
 from __future__ import annotations
@@ -18,7 +23,9 @@ from medic.config import Settings, settings
 from medic.domain import matching as mt
 from medic.domain import orders as od
 from medic.domain import prescriptions as rx
-from medic.domain.geo import EtaBreakdown
+from medic.domain import triage
+from medic.domain.deadlines import promise_band
+from medic.domain.orders import GateState, OrderStatus, assert_gate_transition
 from medic.domain.pricing import (
     OrderTotals,
     PricedLine,
@@ -32,20 +39,19 @@ from medic.domain.schedules import (
     policy_for,
 )
 from medic.models import (
-    AuditEvent,
     Chemist,
-    ChemistStock,
     Customer,
-    GateState,
     Medicine,
+    Offer,
+    OfferState,
     Order,
     OrderItem,
-    OrderStatus,
     Prescription,
     PrescriptionItem,
     PrescriptionStatus,
-    RegisterEntry,
 )
+from medic.services import dispatching, dispensing, stock, supply
+from medic.services.audit import audit
 
 
 class OrderingError(Exception):
@@ -71,19 +77,15 @@ def _audit(
     subject_id: int,
     detail: str | None = None,
 ) -> None:
-    session.add(
-        AuditEvent(
-            actor=actor,
-            action=action,
-            subject_type=subject_type,
-            subject_id=subject_id,
-            detail=detail,
-        )
+    """Kept as a thin alias so existing call sites stay unchanged."""
+    audit(
+        session,
+        actor=actor,
+        action=action,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        detail=detail,
     )
-    # Flush here rather than leaving it to the next write: the audit trail has to
-    # be readable the moment the step it records has happened, and the last step
-    # in a flow has no later write to piggyback on.
-    session.flush()
 
 
 # --------------------------------------------------------------------------
@@ -270,7 +272,17 @@ def reject_prescription(
     )
 
     for order in _orders_awaiting(session, prescription.id):
+        assert_gate_transition("prescription", order.rx_gate, GateState.FAILED)
         order.rx_gate = GateState.FAILED
+        # Whatever stage the order had reached, everything it was holding goes
+        # back: any open offer is superseded and any leased stock released.
+        # Without this a rejected prescription can leave units reserved at a
+        # chemist for an order that will never be dispensed.
+        dispatching.supersede_open_offers(
+            session, order.id, reason=f"prescription rejected: {reason}"
+        )
+        stock.release(session, order_id=order.id)
+        order.chemist_id = None
         _close_order(
             session,
             order,
@@ -281,12 +293,24 @@ def reject_prescription(
     return prescription
 
 
+#: Every live status at which an order can still be waiting on a pharmacist.
+#: SEEKING_CHEMIST matters most: an order being re-offered while verification
+#: is pending must still be closed when the prescription is REJECTED. Missing
+#: it would leave the dispatcher happily offering an order whose prescription
+#: a pharmacist has already refused.
+_AWAITING_RX_STATUSES = (
+    OrderStatus.SEEKING_CHEMIST,
+    OrderStatus.AWAITING_FULFILMENT,
+    OrderStatus.READY_FOR_PICKUP,
+)
+
+
 def _orders_awaiting(session: Session, prescription_id: int) -> list[Order]:
     return list(
         session.scalars(
             select(Order).where(
                 Order.prescription_id == prescription_id,
-                Order.status == OrderStatus.AWAITING_FULFILMENT,
+                Order.status.in_(_AWAITING_RX_STATUSES),
                 Order.rx_gate == GateState.PENDING,
             )
         )
@@ -296,33 +320,6 @@ def _orders_awaiting(session: Session, prescription_id: int) -> list[Order]:
 # --------------------------------------------------------------------------
 # Quoting and placing orders
 # --------------------------------------------------------------------------
-
-
-def _candidates(session: Session) -> list[mt.ChemistCandidate]:
-    chemists = list(session.scalars(select(Chemist)))
-    stock_rows = list(session.scalars(select(ChemistStock)))
-    by_chemist: dict[int, dict[int, int]] = {}
-    for row in stock_rows:
-        by_chemist.setdefault(row.chemist_id, {})[row.medicine_id] = row.qty_on_hand
-    return [
-        mt.ChemistCandidate(
-            chemist_id=chemist.id,
-            name=chemist.name,
-            zone=chemist.zone,
-            lat=chemist.lat,
-            lng=chemist.lng,
-            is_active=chemist.is_active,
-            is_24x7=chemist.is_24x7,
-            opens_hour_ist=chemist.opens_hour_ist,
-            closes_hour_ist=chemist.closes_hour_ist,
-            can_cold_chain=chemist.can_cold_chain,
-            stock=by_chemist.get(chemist.id, {}),
-            acceptance_rate=chemist.acceptance_rate,
-            on_time_rate=chemist.on_time_rate,
-            licence_expires_on=chemist.licence_expires_on,
-        )
-        for chemist in chemists
-    ]
 
 
 def _basket(session: Session, lines: list[LineRequest]) -> list[tuple[Medicine, int]]:
@@ -340,44 +337,76 @@ def _basket(session: Session, lines: list[LineRequest]) -> list[tuple[Medicine, 
 
 
 @dataclass(frozen=True)
-class Quote:
-    """What the customer sees before paying."""
-
+class PricedBasket:
     lines: tuple[PricedLine, ...]
     totals: OrderTotals
-    chemist_id: int
-    chemist_name: str
-    eta: EtaBreakdown
+
+
+def price_basket(
+    session: Session,
+    *,
+    lines: list[LineRequest],
+    commission_bps: int | None = None,
+    config: Settings = settings,
+) -> tuple[tuple[PricedLine, ...], OrderTotals]:
+    """Price a basket without reference to any chemist.
+
+    Pricing used to be computed against the matched chemist's own commission
+    rate, which coupled the price a patient sees to who happens to be nearest.
+    Under the offer loop the chemist is not known at checkout, so the customer
+    is priced at the platform rate and the settlement rate is recorded per
+    chemist when one accepts.
+    """
+    basket = _basket(session, lines)
+    priced = tuple(
+        price_line(
+            medicine_id=medicine.id,
+            medicine_name=medicine.name,
+            qty=qty,
+            mrp_paise=medicine.mrp_paise,
+            dpco_ceiling_paise=medicine.dpco_ceiling_paise,
+        )
+        for medicine, qty in basket
+    )
+    totals = total_order(
+        list(priced),
+        commission_bps=commission_bps or config.commission_bps_default,
+        config=config,
+    )
+    return priced, totals
+
+
+@dataclass(frozen=True)
+class Feasibility:
+    """Can anyone fill this, and roughly how fast -- with no names attached."""
+
+    feasible: bool
+    candidate_count: int
+    eta_minutes_low: int
+    eta_minutes_high: int
     requires_prescription: bool
     requires_verification: bool
     promise_minutes: int
-
-    @property
-    def contribution_paise(self) -> int:
-        return contribution_for(self.totals).contribution_paise
+    reason: str = ""
 
 
-def quote_order(
+def assess_feasibility(
     session: Session,
     *,
-    customer_id: int,
     lines: list[LineRequest],
     delivery_lat: float,
     delivery_lng: float,
     now: datetime | None = None,
     config: Settings = settings,
-) -> Quote:
-    """Price and match a basket without committing to it.
+) -> Feasibility:
+    """A two-sided predicate, not an assignment.
 
-    Raises rather than returning a partial quote: a customer should not be shown
-    a 60-minute promise we have no chemist to keep.
+    A quote must never name a chemist or state a firm promise: nobody has
+    agreed to anything yet. It answers only "is there at least one chemist who
+    could fill this in time", and returns a band.
     """
     now = now or _now()
-    if session.get(Customer, customer_id) is None:
-        raise OrderingError(f"unknown customer {customer_id}")
     basket = _basket(session, lines)
-
-    # Fails closed for Schedule X and anything unclassified.
     controls = controls_for_basket([(m.name, m.schedule) for m, _ in basket])
 
     basket_lines = [
@@ -394,40 +423,38 @@ def quote_order(
         basket_lines,
         delivery_lat=delivery_lat,
         delivery_lng=delivery_lng,
-        candidates=_candidates(session),
+        candidates=supply.candidates_near(
+            session, lat=delivery_lat, lng=delivery_lng, config=config
+        ),
         at=now,
         config=config,
     )
-    best = result.best
-    if best is None:
+    if not result.full_fills:
         detail = ""
         if result.partial_fills:
             missing = ", ".join(result.partial_fills[0].missing)
             detail = f" Nearest partner chemist is short of: {missing}."
-        raise OrderingError(
-            "No partner chemist can fill this basket inside the 60-minute window." + detail
+        return Feasibility(
+            feasible=False,
+            candidate_count=0,
+            eta_minutes_low=0,
+            eta_minutes_high=0,
+            requires_prescription=controls.requires_prescription,
+            requires_verification=controls.requires_pharmacist_verification,
+            promise_minutes=config.delivery_promise_minutes,
+            reason=(
+                "No partner chemist can fill this basket inside the "
+                f"{config.delivery_promise_minutes}-minute window." + detail
+            ),
         )
 
-    chemist = session.get(Chemist, best.candidate.chemist_id)
-    assert chemist is not None
-    priced = [
-        price_line(
-            medicine_id=medicine.id,
-            medicine_name=medicine.name,
-            qty=qty,
-            mrp_paise=medicine.mrp_paise,
-            dpco_ceiling_paise=medicine.dpco_ceiling_paise,
-        )
-        for medicine, qty in basket
-    ]
-    totals = total_order(priced, commission_bps=chemist.commission_bps, config=config)
-
-    return Quote(
-        lines=tuple(priced),
-        totals=totals,
-        chemist_id=chemist.id,
-        chemist_name=chemist.name,
-        eta=best.eta,
+    best = result.full_fills[0].eta.total_minutes
+    low, high = promise_band(best, config=config)
+    return Feasibility(
+        feasible=True,
+        candidate_count=len(result.full_fills),
+        eta_minutes_low=low,
+        eta_minutes_high=high,
         requires_prescription=controls.requires_prescription,
         requires_verification=controls.requires_pharmacist_verification,
         promise_minutes=config.delivery_promise_minutes,
@@ -501,17 +528,21 @@ def place_order(
             except rx.PrescriptionProblem as exc:
                 raise OrderingError(str(exc)) from exc
 
-    # Only now, with the basket lawful and its paperwork in hand, look for a
-    # chemist who can actually fill it inside the window.
-    quote = quote_order(
+    # Price the basket and check that SOMEONE could fill it, without choosing
+    # or freezing anyone. This is the central change: the request no longer
+    # carries an assignment. Dispatch finds a chemist asynchronously, and the
+    # firm promise is made when one accepts.
+    assessment = assess_feasibility(
         session,
-        customer_id=customer_id,
         lines=lines,
         delivery_lat=delivery_lat,
         delivery_lng=delivery_lng,
         now=now,
         config=config,
     )
+    if not assessment.feasible:
+        raise OrderingError(assessment.reason)
+    priced, totals = price_basket(session, lines=lines, config=config)
 
     rx_gate = GateState.NOT_REQUIRED
     if controls.requires_pharmacist_verification:
@@ -523,46 +554,44 @@ def place_order(
 
     order = Order(
         customer_id=customer_id,
-        chemist_id=quote.chemist_id,
+        chemist_id=None,
         prescription_id=prescription.id if prescription else None,
         status=OrderStatus.CREATED,
-        chemist_gate=GateState.PENDING,
+        chemist_gate=GateState.SEEKING,
         rx_gate=rx_gate,
         delivery_zone=delivery_zone,
         delivery_lat=delivery_lat,
         delivery_lng=delivery_lng,
-        subtotal_paise=quote.totals.subtotal_paise,
-        chemist_discount_paise=quote.totals.chemist_funded_discount_paise,
-        platform_discount_paise=quote.totals.platform_funded_discount_paise,
-        delivery_fee_paise=quote.totals.delivery_fee_paise,
-        total_paise=quote.totals.total_paise,
-        commission_paise=quote.totals.commission_paise,
-        promised_minutes=quote.promise_minutes,
-        eta_minutes_at_checkout=quote.eta.total_minutes,
+        urgency=triage.urgency_for([m.urgency for m, _ in basket]),
+        subtotal_paise=totals.subtotal_paise,
+        chemist_discount_paise=totals.chemist_funded_discount_paise,
+        platform_discount_paise=totals.platform_funded_discount_paise,
+        delivery_fee_paise=totals.delivery_fee_paise,
+        total_paise=totals.total_paise,
+        commission_paise=totals.commission_paise,
+        promised_minutes=config.delivery_promise_minutes,
+        eta_minutes_at_checkout=assessment.eta_minutes_high,
         created_at=now,
     )
     session.add(order)
     session.flush()
 
-    for priced, (medicine, _) in zip(quote.lines, basket, strict=True):
+    for priced_line, (medicine, _) in zip(priced, basket, strict=True):
         session.add(
             OrderItem(
                 order_id=order.id,
                 medicine_id=medicine.id,
-                qty=priced.qty,
+                qty=priced_line.qty,
                 medicine_name=medicine.name,
                 schedule=DrugSchedule(medicine.schedule),
-                unit_price_paise=priced.unit_price_paise,
-                mrp_paise=priced.mrp_paise,
-                line_total_paise=priced.line_total_paise,
+                unit_price_paise=priced_line.unit_price_paise,
+                mrp_paise=priced_line.mrp_paise,
+                line_total_paise=priced_line.line_total_paise,
             )
         )
 
-    od.assert_can_transition(order.status, OrderStatus.AWAITING_FULFILMENT)
-    order.status = OrderStatus.AWAITING_FULFILMENT
-    chemist = session.get(Chemist, quote.chemist_id)
-    assert chemist is not None
-    chemist.orders_offered += 1
+    od.assert_can_transition(order.status, OrderStatus.SEEKING_CHEMIST)
+    order.status = OrderStatus.SEEKING_CHEMIST
     session.flush()
 
     _audit(
@@ -571,21 +600,37 @@ def place_order(
         action="order.placed",
         subject_type="order",
         subject_id=order.id,
-        detail=f"chemist={quote.chemist_id} eta={quote.eta.total_minutes}min rx_gate={rx_gate}",
+        detail=(
+            f"urgency={order.urgency} rx_gate={rx_gate} "
+            f"eta_band={assessment.eta_minutes_low}-{assessment.eta_minutes_high}min "
+            f"candidates={assessment.candidate_count}"
+        ),
     )
+    # Make the first offer immediately rather than waiting for the worker
+    # tick: the 60-minute clock is already running.
+    dispatching.advance_sourcing(session, order_id=order.id, now=now, config=config)
     return order
 
 
 # --------------------------------------------------------------------------
-# Chemist gate
+# Chemist gate -- now thin delegations to the dispatcher
 # --------------------------------------------------------------------------
 
 
 def chemist_queue(session: Session, chemist_id: int) -> list[Order]:
-    return list(
-        session.scalars(
-            select(Order)
-            .where(
+    """Orders this chemist is currently holding, offered or accepted."""
+    offered = {
+        o.order_id
+        for o in session.scalars(
+            select(Offer).where(
+                Offer.chemist_id == chemist_id, Offer.state == OfferState.OFFERED
+            )
+        )
+    }
+    assigned = {
+        o.id
+        for o in session.scalars(
+            select(Order).where(
                 Order.chemist_id == chemist_id,
                 Order.status.in_(
                     [
@@ -595,128 +640,13 @@ def chemist_queue(session: Session, chemist_id: int) -> list[Order]:
                     ]
                 ),
             )
-            .order_by(Order.created_at)
         )
-    )
-
-
-def _reserve_stock(session: Session, order: Order) -> None:
-    """Hold the stock the chemist just confirmed, so it is not promised twice."""
-    for item in order.items:
-        row = session.scalars(
-            select(ChemistStock).where(
-                ChemistStock.chemist_id == order.chemist_id,
-                ChemistStock.medicine_id == item.medicine_id,
-            )
-        ).first()
-        if row is None or row.qty_on_hand < item.qty:
-            have = row.qty_on_hand if row else 0
-            raise OrderingError(
-                f"{item.medicine_name}: {item.qty} needed but {have} on hand. "
-                f"Reject the order as a stock-out instead of confirming it."
-            )
-        row.qty_on_hand -= item.qty
-
-
-def _release_stock(session: Session, order: Order) -> None:
-    for item in order.items:
-        row = session.scalars(
-            select(ChemistStock).where(
-                ChemistStock.chemist_id == order.chemist_id,
-                ChemistStock.medicine_id == item.medicine_id,
-            )
-        ).first()
-        if row is not None:
-            row.qty_on_hand += item.qty
-
-
-def chemist_accept(session: Session, *, order_id: int, chemist_id: int) -> Order:
-    """Chemist accepts the order and confirms the stock is physically there."""
-    order = session.get(Order, order_id)
-    if order is None:
-        raise OrderingError(f"unknown order {order_id}")
-    if order.chemist_id != chemist_id:
-        raise OrderingError("this order was not offered to you")
-    if order.status != OrderStatus.AWAITING_FULFILMENT:
-        raise OrderingError(f"order {order_id} is {order.status} and cannot be accepted")
-    if order.chemist_gate is not GateState.PENDING:
-        raise OrderingError(f"order {order_id} has already been {order.chemist_gate.lower()}")
-
-    _reserve_stock(session, order)
-    order.chemist_gate = GateState.CLEARED
-    order.accepted_at = _now()
-    chemist = session.get(Chemist, chemist_id)
-    assert chemist is not None
-    chemist.orders_accepted += 1
-    session.flush()
-    _audit(
-        session,
-        actor=f"chemist:{chemist_id}",
-        action="order.accepted",
-        subject_type="order",
-        subject_id=order.id,
-    )
-    _maybe_ready(session, order)
-    return order
-
-
-def chemist_reject(
-    session: Session, *, order_id: int, chemist_id: int, reason: str, stock_out: bool = True
-) -> Order:
-    order = session.get(Order, order_id)
-    if order is None:
-        raise OrderingError(f"unknown order {order_id}")
-    if order.chemist_id != chemist_id:
-        raise OrderingError("this order was not offered to you")
-    # A chemist can pull out any time before the rider collects: they may have
-    # accepted on a declared stock figure and then found the strip missing,
-    # damaged or short-dated on the shelf.
-    if order.status not in (OrderStatus.AWAITING_FULFILMENT, OrderStatus.READY_FOR_PICKUP):
-        raise OrderingError(f"order {order_id} is {order.status} and cannot be rejected")
-
-    if order.chemist_gate is GateState.CLEARED:
-        _release_stock(session, order)
-    order.chemist_gate = GateState.FAILED
-    _close_order(
-        session,
-        order,
-        status=OrderStatus.CANCELLED_STOCK_OUT if stock_out else OrderStatus.CANCELLED_NO_CHEMIST,
-        reason=reason,
-        actor=f"chemist:{chemist_id}",
-    )
-    return order
-
-
-def _clear_rx_gate(session: Session, order: Order, actor: str) -> None:
-    order.rx_gate = GateState.CLEARED
-    order.verified_at = _now()
-    session.flush()
-    _audit(
-        session,
-        actor=actor,
-        action="order.rx_cleared",
-        subject_type="order",
-        subject_id=order.id,
-    )
-    _maybe_ready(session, order)
-
-
-def _maybe_ready(session: Session, order: Order) -> None:
-    """Promote to READY_FOR_PICKUP once both gates have cleared."""
-    if order.status != OrderStatus.AWAITING_FULFILMENT:
-        return
-    if not od.gates_cleared(order.chemist_gate, order.rx_gate):
-        return
-    od.assert_can_transition(order.status, OrderStatus.READY_FOR_PICKUP)
-    order.status = OrderStatus.READY_FOR_PICKUP
-    session.flush()
-    _audit(
-        session,
-        actor="system",
-        action="order.ready_for_pickup",
-        subject_type="order",
-        subject_id=order.id,
-    )
+    }
+    ids = offered | assigned
+    if not ids:
+        return []
+    orders = list(session.scalars(select(Order).where(Order.id.in_(ids))))
+    return sorted(orders, key=lambda o: o.created_at)
 
 
 def _close_order(
@@ -736,6 +666,26 @@ def _close_order(
     )
 
 
+def _clear_rx_gate(session: Session, order: Order, actor: str) -> None:
+    assert_gate_transition("prescription", order.rx_gate, GateState.CLEARED)
+    order.rx_gate = GateState.CLEARED
+    order.verified_at = _now()
+    session.flush()
+    _audit(
+        session,
+        actor=actor,
+        action="order.rx_cleared",
+        subject_type="order",
+        subject_id=order.id,
+    )
+    dispatching.maybe_ready(session, order)
+    # A verification that lands while the order is still being sourced does
+    # not make it ready -- there is no chemist yet -- but it does unblock the
+    # next offer round, so nudge the dispatcher.
+    if order.status is OrderStatus.SEEKING_CHEMIST:
+        dispatching.advance_sourcing(session, order_id=order.id)
+
+
 def cancel_by_customer(session: Session, *, order_id: int, customer_id: int, reason: str) -> Order:
     order = session.get(Order, order_id)
     if order is None:
@@ -747,8 +697,16 @@ def cancel_by_customer(session: Session, *, order_id: int, customer_id: int, rea
             "the rider already holds this order; call support so the medicines can be "
             "returned to the dispensing chemist"
         )
-    if order.chemist_gate is GateState.CLEARED:
-        _release_stock(session, order)
+    # Custody is read from the dispensing record, not from the status column.
+    # Once transport events arrive asynchronously, status is no longer a sound
+    # proxy for where the goods physically are.
+    if dispensing.already_dispensed(session, order_id):
+        raise OrderingError(
+            "these medicines have already left the pharmacy; call support so they can be "
+            "returned to the dispensing chemist"
+        )
+    dispatching.supersede_open_offers(session, order_id, reason="cancelled by the customer")
+    stock.release(session, order_id=order_id)
     _close_order(
         session,
         order,
@@ -759,75 +717,18 @@ def cancel_by_customer(session: Session, *, order_id: int, customer_id: int, rea
     return order
 
 
-# --------------------------------------------------------------------------
-# Dispatch and delivery
-# --------------------------------------------------------------------------
-
-
 def dispatch(session: Session, *, order_id: int, rider: str, actor: str = "admin") -> Order:
-    """Rider collects from the chemist. This is the dispensing event.
+    """Operator override for collection, kept for the admin console.
 
-    The Schedule H1 register entry and the prescription's use count are both
-    written here rather than on delivery, because the medicine leaves the
-    pharmacy's custody at pickup.
+    Routed through the dispensing service so it cannot diverge from the
+    courier's own collection path: the register write happens in exactly one
+    place regardless of who triggers it.
     """
     order = session.get(Order, order_id)
     if order is None:
         raise OrderingError(f"unknown order {order_id}")
     od.assert_can_transition(order.status, OrderStatus.OUT_FOR_DELIVERY)
-    if not od.gates_cleared(order.chemist_gate, order.rx_gate):
-        raise OrderingError(
-            f"order {order_id} has not cleared both gates "
-            f"(chemist={order.chemist_gate}, prescription={order.rx_gate})"
-        )
-
-    chemist = session.get(Chemist, order.chemist_id) if order.chemist_id else None
-    if chemist is None:
-        raise OrderingError(f"order {order_id} has no assigned chemist")
-    customer = session.get(Customer, order.customer_id)
-    assert customer is not None
-    prescription = (
-        session.get(Prescription, order.prescription_id) if order.prescription_id else None
-    )
-
-    register_lines = [
-        item for item in order.items if policy_for(item.schedule).requires_register_entry
-    ]
-    for item in register_lines:
-        session.add(
-            RegisterEntry(
-                order_id=order.id,
-                chemist_id=chemist.id,
-                medicine_name=item.medicine_name,
-                schedule=item.schedule,
-                qty=item.qty,
-                patient_name=customer.name,
-                patient_phone=customer.phone,
-                prescriber_name=prescription.prescriber_name if prescription else None,
-                prescriber_reg_no=prescription.prescriber_reg_no if prescription else None,
-                pharmacist_reg_no=chemist.pharmacist_reg_no,
-            )
-        )
-
-    if prescription is not None:
-        for item in order.items:
-            if not policy_for(item.schedule).requires_prescription:
-                continue
-            authorised = next(
-                (row for row in prescription.items if row.medicine_id == item.medicine_id), None
-            )
-            if authorised is None:
-                raise OrderingError(
-                    f"{item.medicine_name} is not covered by prescription {prescription.id}"
-                )
-            if authorised.dispensed_qty + item.qty > authorised.authorised_qty:
-                raise OrderingError(
-                    f"{item.medicine_name}: dispensing {item.qty} would exceed the "
-                    f"{authorised.authorised_qty} authorised on this prescription"
-                )
-            authorised.dispensed_qty += item.qty
-        prescription.uses_count += 1
-
+    dispensing.dispense(session, order=order, courier_id=None, actor=actor)
     order.status = OrderStatus.OUT_FOR_DELIVERY
     order.dispatched_at = _now()
     session.flush()
@@ -837,7 +738,7 @@ def dispatch(session: Session, *, order_id: int, rider: str, actor: str = "admin
         action="order.dispatched",
         subject_type="order",
         subject_id=order.id,
-        detail=f"rider={rider} register_entries={len(register_lines)}",
+        detail=f"rider={rider} (manual override)",
     )
     return order
 

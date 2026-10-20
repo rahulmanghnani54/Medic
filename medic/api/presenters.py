@@ -37,6 +37,11 @@ def medicine_out(medicine: Medicine) -> MedicineOut:
 
 def waiting_on(order: Order) -> str:
     """Plain-language statement of what the order is blocked on."""
+    if order.status is OrderStatus.SEEKING_CHEMIST:
+        waits = ["a chemist to accept"]
+        if order.rx_gate is GateState.PENDING:
+            waits.append("pharmacist to verify the prescription")
+        return " and ".join(waits)
     if order.status is OrderStatus.AWAITING_FULFILMENT:
         blocked = []
         if order.chemist_gate is GateState.PENDING:
@@ -53,22 +58,38 @@ def waiting_on(order: Order) -> str:
 
 _CUSTOMER_MESSAGE = {
     OrderStatus.CREATED: "Finding a partner chemist near you.",
+    OrderStatus.SEEKING_CHEMIST: "Finding a partner chemist near you.",
     OrderStatus.READY_FOR_PICKUP: "Packed. A rider is on the way to collect it.",
     OrderStatus.OUT_FOR_DELIVERY: "Out for delivery.",
     OrderStatus.DELIVERED: "Delivered.",
     OrderStatus.BLOCKED_NOT_DISPENSABLE: (
         "This medicine cannot be supplied through the app. Please visit a pharmacy in person."
     ),
-    OrderStatus.CANCELLED_NO_CHEMIST: "No partner chemist could fill this order in time.",
+    # Under the offer loop a stock-out is a routing event, so the closure a
+    # patient actually sees for one is this: every nearby chemist was asked and
+    # none could fill it in time. The money reassurance has to live here now --
+    # it used to sit only on CANCELLED_STOCK_OUT, which is no longer the state
+    # a stock-out ends in.
+    OrderStatus.CANCELLED_NO_CHEMIST: (
+        "No partner chemist could fill this order in time. You have not been charged."
+    ),
     OrderStatus.CANCELLED_STOCK_OUT: "The chemist was out of stock. You have not been charged.",
     OrderStatus.REJECTED_PRESCRIPTION: (
-        "Our pharmacist could not accept this prescription. See the reason below."
+        "Our pharmacist could not accept this prescription. You have not been charged. "
+        "See the reason below."
     ),
     OrderStatus.CANCELLED_BY_CUSTOMER: "Cancelled at your request.",
 }
 
 
 def customer_message(order: Order) -> str:
+    if order.status is OrderStatus.SEEKING_CHEMIST:
+        if order.rx_gate is GateState.PENDING:
+            return (
+                "Finding a partner chemist, and our pharmacist is verifying your "
+                "prescription at the same time."
+            )
+        return "Finding a partner chemist near you."
     if order.status is OrderStatus.AWAITING_FULFILMENT:
         if order.rx_gate is GateState.PENDING:
             return "Our pharmacist is verifying your prescription. This usually takes 5-10 minutes."
@@ -87,6 +108,9 @@ def order_out(session: Session, order: Order, *, now: datetime | None = None) ->
         prescription_gate=str(order.rx_gate),
         chemist_id=order.chemist_id,
         chemist_name=chemist.name if chemist else None,
+        urgency=str(order.urgency),
+        sourcing_attempts=order.attempt_seq,
+        committed_eta_minutes=order.committed_eta_minutes,
         items=[
             OrderItemOut(
                 medicine_name=item.medicine_name,

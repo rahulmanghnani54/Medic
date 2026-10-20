@@ -61,7 +61,8 @@
 </main>
 
 <script type="module">
-import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+import { api, el, banner, clearBanner, setChildren, statusPill, schedulePill, pageHeader }
+  from '/static/api.js';
 
 const ZONES = {
   'Malviya Nagar': [26.8505, 75.8060],
@@ -167,15 +168,24 @@ async function refreshQuote() {
       body: { customer_id: customerId(), lines, delivery_lat: lat, delivery_lng: lng },
     });
     const saving = Number(quote.chemist_funded_discount) > 0;
+    if (!quote.feasible) {
+      $('quote').replaceChildren(el('div', { class: 'banner info',
+        text: 'No partner chemist can fill this inside the 60-minute window right now.' }));
+      $('place').disabled = true;
+      return;
+    }
+    // An estimate and a band, never a named chemist: at this point nobody has
+    // agreed to anything, so naming one would state a commitment we do not have.
     $('quote').replaceChildren(
       el('div', { class: 'grid' },
-        stat('Chemist', quote.chemist_name),
-        stat('Estimated', `${quote.eta_minutes} min`),
+        stat('Chemists nearby', quote.candidate_count),
+        stat('Estimated', `${quote.eta_minutes_low}-${quote.eta_minutes_high} min`),
         stat('Promise', `${quote.promise_minutes} min`),
         stat('Total', `₹${quote.total}`)),
       el('p', { class: 'note' },
         `Subtotal ₹${quote.subtotal} + delivery ₹${quote.delivery_fee}`,
-        saving ? ` · chemist discount ₹${quote.chemist_funded_discount}` : ''),
+        saving ? ` · chemist discount ₹${quote.chemist_funded_discount}` : '',
+        '. Your chemist is confirmed once one accepts.'),
     );
     $('rx-block').hidden = !quote.requires_prescription;
     $('place').disabled = quote.requires_prescription && !prescriptionId;
@@ -249,7 +259,7 @@ function renderOrder(order) {
     el('tr', {}, el('td', { text: item.medicine_name }), el('td', {}, schedulePill(item.schedule)),
       el('td', { class: 'num', text: item.qty }), el('td', { class: 'num', text: `₹${item.line_total}` })));
   const late = order.sla_breached;
-  $('order').replaceChildren(
+  setChildren($('order'),
     el('div', { class: 'flex' },
       el('strong', { text: `Order #${order.id}` }), statusPill(order.status),
       el('span', {
@@ -261,7 +271,12 @@ function renderOrder(order) {
     el('p', { text: order.customer_message }),
     order.closed_reason ? el('p', { class: 'note', text: order.closed_reason }) : null,
     el('table', {}, el('tbody', {}, items)),
-    el('p', { class: 'note', text: `Chemist: ${order.chemist_name || '—'} · Total ₹${order.total}` }),
+    el('p', { class: 'note' },
+      order.chemist_name
+        ? `Chemist: ${order.chemist_name}`
+        : `Still finding a chemist (${order.sourcing_attempts} asked so far)`,
+      ` · Total ₹${order.total}`,
+      order.committed_eta_minutes ? ` · arriving in about ${order.committed_eta_minutes} min` : ''),
   );
 }
 
@@ -273,7 +288,8 @@ function startPolling() {
       const order = await api('customer', `/api/customer/orders/${orderId}?customer_id=${customerId()}`);
       renderOrder(order);
       if (['DELIVERED', 'CANCELLED_STOCK_OUT', 'REJECTED_PRESCRIPTION',
-           'CANCELLED_BY_CUSTOMER', 'CANCELLED_NO_CHEMIST'].includes(order.status)) {
+           'CANCELLED_BY_CUSTOMER', 'CANCELLED_NO_CHEMIST',
+           'BLOCKED_NOT_DISPENSABLE'].includes(order.status)) {
         clearInterval(poller);
       }
     } catch { /* keep polling; a transient failure is not worth a banner */ }

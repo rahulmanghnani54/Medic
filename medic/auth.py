@@ -13,9 +13,14 @@ docs/compliance.md.
 
 from __future__ import annotations
 
+import hashlib
+
 from fastapi import Depends, Header, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from medic.config import settings
+from medic.models import Courier
 
 Role = str
 
@@ -39,3 +44,26 @@ def require_role(expected: Role):
         return _actor_from(x_medic_token, expected)
 
     return Depends(dependency)
+
+
+def courier_from_token(session: Session, token: str | None) -> Courier:
+    """Resolve a courier from their own secret, not a shared role token.
+
+    This one role cannot use the shared-token scheme above. The Schedule H1
+    register records who took custody of a package, and a secret shared by
+    the whole fleet cannot answer that question -- it would put a name on a
+    statutory record that nothing authenticated.
+    """
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing X-Medic-Token header"
+        )
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    courier = session.scalars(select(Courier).where(Courier.token_sha256 == digest)).first()
+    if courier is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="this endpoint requires a courier token"
+        )
+    if not courier.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="courier is not active")
+    return courier
