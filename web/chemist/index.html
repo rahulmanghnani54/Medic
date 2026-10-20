@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chemist dashboard</title>
+<link rel="icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="header"></div>
+<main>
+  <div id="banner"></div>
+
+  <section>
+    <h2>Partner pharmacy</h2>
+    <div class="row">
+      <div>
+        <label for="chemist">Store</label>
+        <select id="chemist"></select>
+      </div>
+      <div style="flex: 0 0 auto">
+        <button id="refresh" class="secondary">Refresh</button>
+      </div>
+      <div style="flex: 0 0 auto">
+        <a href="#" id="register"><button class="secondary" type="button">Download H1 register (CSV)</button></a>
+      </div>
+    </div>
+    <p class="note">
+      Accepting an order means the stock is physically on your shelf. If it is not,
+      reject it as a stock-out — that is faster for the patient than a late cancellation,
+      and it does not count against you the way a missed delivery does.
+    </p>
+  </section>
+
+  <section>
+    <h2>Live orders</h2>
+    <div id="orders"><p class="empty">Nothing waiting.</p></div>
+  </section>
+
+  <section>
+    <h2>Declared stock</h2>
+    <p class="note">
+      Orders are only routed to you for medicines you have stock against. Keeping these
+      numbers current is what makes the 60-minute promise keepable.
+    </p>
+    <div id="stock"><p class="empty">Loading…</p></div>
+  </section>
+</main>
+
+<script type="module">
+import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+
+// The pilot's seeded partner chemists. A real dashboard scopes this to the logged-in store.
+const STORES = [
+  [1, 'Shree Krishna Medicos (Malviya Nagar)'],
+  [2, 'Vaishali Medical Store'],
+  [3, 'Mansarovar Chemists'],
+  [4, 'C-Scheme Pharmacy'],
+  [5, 'Raja Park Drug House'],
+];
+
+const $ = (id) => document.getElementById(id);
+document.getElementById('header').replaceWith(pageHeader('Chemist dashboard', 'chemist'));
+for (const [id, name] of STORES) $('chemist').append(el('option', { value: id, text: name }));
+
+const chemistId = () => Number($('chemist').value);
+
+function updateRegisterLink() {
+  $('register').href = `/api/chemist/${chemistId()}/register.csv`;
+}
+
+async function loadOrders() {
+  clearBanner($('banner'));
+  try {
+    const orders = await api('chemist', `/api/chemist/${chemistId()}/orders`);
+    if (!orders.length) {
+      return $('orders').replaceChildren(el('p', { class: 'empty', text: 'Nothing waiting.' }));
+    }
+    $('orders').replaceChildren(...orders.map(orderCard));
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function orderCard(order) {
+  const pending = order.chemist_gate === 'PENDING';
+  const withdrawable = ['AWAITING_FULFILMENT', 'READY_FOR_PICKUP'].includes(order.status);
+  const late = order.sla_breached;
+  return el('div', { class: 'stat', style: 'margin-bottom:10px' },
+    el('div', { class: 'flex' },
+      el('strong', { text: `Order #${order.id}` }),
+      statusPill(order.status),
+      el('span', {
+        class: `pill ${late ? 'bad' : order.minutes_remaining <= 15 ? 'wait' : 'ok'}`,
+        text: late ? `${Math.abs(order.minutes_remaining)} min over` : `${order.minutes_remaining} min left`,
+      }),
+      order.prescription_gate === 'PENDING'
+        ? el('span', { class: 'pill rx', text: 'awaiting pharmacist' }) : null),
+    el('table', { style: 'margin:10px 0' },
+      el('tbody', {}, order.items.map((item) =>
+        el('tr', {},
+          el('td', { text: item.medicine_name }),
+          el('td', {}, schedulePill(item.schedule)),
+          el('td', { class: 'num', text: `× ${item.qty}` }),
+          el('td', { class: 'num', text: `₹${item.line_total}` }))))),
+    el('div', { class: 'flex' },
+      pending
+        ? el('button', { onclick: () => accept(order.id) }, 'Accept — stock confirmed')
+        : el('span', { class: 'pill ok', text: 'stock confirmed' }),
+      withdrawable
+        ? el('button', { class: 'danger', onclick: () => reject(order.id) }, 'Stock-out')
+        : null),
+  );
+}
+
+async function accept(orderId) {
+  try {
+    await api('chemist', `/api/chemist/${chemistId()}/orders/${orderId}/accept`, { method: 'POST' });
+    await Promise.all([loadOrders(), loadStock()]);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function reject(orderId) {
+  const reason = prompt('Reason (the patient is told this):', 'not in stock');
+  if (!reason) return;
+  try {
+    await api('chemist', `/api/chemist/${chemistId()}/orders/${orderId}/reject`, {
+      method: 'POST', body: { reason, stock_out: true },
+    });
+    await Promise.all([loadOrders(), loadStock()]);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function loadStock() {
+  try {
+    const rows = await api('chemist', `/api/chemist/${chemistId()}/stock`);
+    if (!rows.length) {
+      return $('stock').replaceChildren(el('p', { class: 'empty', text: 'No stock declared.' }));
+    }
+    $('stock').replaceChildren(
+      el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', { text: 'Medicine' }), el('th', { text: 'Category' }),
+          el('th', { class: 'num', text: 'On hand' }), el('th', { text: 'Source' }), el('th', {}))),
+        el('tbody', {}, rows.map((row) =>
+          el('tr', {},
+            el('td', { text: row.medicine_name }),
+            el('td', {}, schedulePill(row.schedule)),
+            el('td', { class: 'num' },
+              el('input', {
+                type: 'number', min: '0', value: row.qty_on_hand,
+                style: 'width:80px', 'data-medicine': row.medicine_id,
+              })),
+            el('td', {}, el('span', { class: 'pill wait', text: row.source })),
+            el('td', { class: 'num' },
+              el('button', {
+                class: 'secondary',
+                onclick: (event) => saveStock(row.medicine_id, event.target),
+              }, 'Save')))))),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function saveStock(medicineId, button) {
+  const input = document.querySelector(`input[data-medicine="${medicineId}"]`);
+  const qty = Number(input.value);
+  button.disabled = true;
+  try {
+    await api('chemist', `/api/chemist/${chemistId()}/stock`, {
+      method: 'PUT',
+      body: [{ medicine_id: medicineId, qty_on_hand: qty, source: 'declared' }],
+    });
+    banner($('banner'), 'ok', 'Stock updated.');
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$('chemist').addEventListener('change', () => {
+  updateRegisterLink();
+  loadOrders();
+  loadStock();
+});
+$('refresh').addEventListener('click', () => { loadOrders(); loadStock(); });
+
+// The register download needs the role header, which a plain link cannot send.
+$('register').addEventListener('click', async (event) => {
+  event.preventDefault();
+  try {
+    const response = await fetch(`/api/chemist/${chemistId()}/register.csv`, {
+      headers: { 'X-Medic-Token': 'dev-chemist-token' },
+    });
+    if (!response.ok) throw new Error(`Register download failed (${response.status})`);
+    const url = URL.createObjectURL(await response.blob());
+    const link = el('a', { href: url, download: `h1-register-chemist-${chemistId()}.csv` });
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+});
+
+updateRegisterLink();
+loadOrders();
+loadStock();
+setInterval(loadOrders, 8000);
+</script>
+</body>
+</html>

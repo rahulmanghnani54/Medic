@@ -1,0 +1,117 @@
+/* Shared styling for the three consoles. One stylesheet, no build step. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #dfe3e8;
+  --ink: #16202b;
+  --ink-soft: #5c6b7a;
+  --accent: #0b6e4f;
+  --accent-soft: #e6f2ed;
+  --warn: #8a5a00;
+  --warn-soft: #fdf3e0;
+  --danger: #a32020;
+  --danger-soft: #fbeaea;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 20px;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+header h1 { font-size: 17px; margin: 0; }
+header .tag {
+  font-size: 12px;
+  color: var(--ink-soft);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 2px 10px;
+}
+header nav { margin-left: auto; display: flex; gap: 14px; font-size: 13px; }
+header nav a { color: var(--ink-soft); text-decoration: none; }
+header nav a:hover { color: var(--accent); }
+
+main { max-width: 1040px; margin: 0 auto; padding: 20px; }
+
+section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+section > h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--ink-soft); }
+
+label { display: block; font-size: 13px; color: var(--ink-soft); margin-bottom: 4px; }
+input, select, textarea {
+  font: inherit; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 6px; background: #fff; color: inherit; width: 100%;
+}
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.row > div { flex: 1 1 160px; }
+
+button {
+  font: inherit; font-weight: 500; cursor: pointer;
+  padding: 8px 14px; border-radius: 6px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff;
+}
+button.secondary { background: #fff; color: var(--ink); border-color: var(--border); }
+button.danger { background: #fff; color: var(--danger); border-color: var(--danger); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-soft); }
+tbody tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.pill {
+  display: inline-block; font-size: 12px; font-weight: 500;
+  padding: 2px 8px; border-radius: 20px; white-space: nowrap;
+}
+.pill.ok { background: var(--accent-soft); color: var(--accent); }
+.pill.wait { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--danger-soft); color: var(--danger); }
+.pill.rx { background: #eceaf8; color: #4b3b9c; }
+
+.note { font-size: 13px; color: var(--ink-soft); margin: 8px 0 0; }
+.banner {
+  border-radius: 6px; padding: 10px 12px; font-size: 14px; margin-bottom: 12px;
+}
+.banner.err { background: var(--danger-soft); color: var(--danger); }
+.banner.ok { background: var(--accent-soft); color: var(--accent); }
+.banner.info { background: var(--warn-soft); color: var(--warn); }
+.empty { color: var(--ink-soft); font-size: 14px; padding: 10px 0; }
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.stat { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.stat .k { font-size: 12px; color: var(--ink-soft); }
+.stat .v { font-size: 20px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+code { font-size: 13px; background: #eef1f4; padding: 1px 5px; border-radius: 4px; }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11161b; --surface: #19212a; --border: #2c3845;
+    --ink: #e8edf2; --ink-soft: #94a3b3;
+    --accent: #4bbf92; --accent-soft: #163329;
+    --warn: #e0ab54; --warn-soft: #33280f;
+    --danger: #e97b7b; --danger-soft: #331a1a;
+  }
+  input, select, textarea, button.secondary { background: #121a21; }
+  code { background: #121a21; }
+}

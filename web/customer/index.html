@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order medicines</title>
+<link rel="icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="header"></div>
+<main>
+  <div id="banner"></div>
+
+  <section>
+    <h2>Search a medicine</h2>
+    <div class="row">
+      <div style="flex: 3 1 260px">
+        <label for="q">Medicine or salt name</label>
+        <input id="q" placeholder="paracetamol, metformin, azithromycin…" autocomplete="off">
+      </div>
+      <div>
+        <label for="customer">Ordering as</label>
+        <select id="customer"></select>
+      </div>
+      <div>
+        <label for="zone">Deliver to</label>
+        <select id="zone"></select>
+      </div>
+    </div>
+    <div id="results"></div>
+  </section>
+
+  <section>
+    <h2>Basket</h2>
+    <div id="basket"></div>
+    <div id="quote"></div>
+    <div id="rx-block" hidden>
+      <p class="note">
+        This basket contains a prescription-only medicine. Upload the prescription;
+        our pharmacist verifies it before the chemist dispenses.
+      </p>
+      <div class="row">
+        <div><label for="rx-file">Prescription image</label><input id="rx-file" type="file"></div>
+        <div><label for="rx-doctor">Prescriber name</label><input id="rx-doctor" placeholder="Dr A Sharma"></div>
+        <div><label for="rx-reg">Prescriber registration no.</label><input id="rx-reg" placeholder="RMC-44120"></div>
+        <div style="flex: 0 0 auto"><button id="rx-upload" class="secondary">Upload</button></div>
+      </div>
+      <div id="rx-status"></div>
+    </div>
+    <div class="flex" style="margin-top: 12px">
+      <button id="place" disabled>Place order</button>
+      <button id="clear" class="secondary">Clear basket</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Your order</h2>
+    <div id="order"><p class="empty">No order yet.</p></div>
+  </section>
+</main>
+
+<script type="module">
+import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+
+const ZONES = {
+  'Malviya Nagar': [26.8505, 75.8060],
+  'Vaishali Nagar': [26.9124, 75.7400],
+  'Mansarovar': [26.8520, 75.7640],
+  'C-Scheme': [26.9065, 75.7985],
+  'Raja Park': [26.8955, 75.8280],
+};
+// The pilot's seeded customers. A real app resolves this from a logged-in session.
+const CUSTOMERS = [[1, 'Anita Verma'], [2, 'Mahesh Gupta'], [3, 'Farah Siddiqui']];
+
+const $ = (id) => document.getElementById(id);
+const basket = new Map();
+let prescriptionId = null;
+let orderId = null;
+let poller = null;
+
+document.getElementById('header').replaceWith(pageHeader('Order medicines', 'customer'));
+for (const [id, name] of CUSTOMERS) $('customer').append(el('option', { value: id, text: name }));
+for (const zone of Object.keys(ZONES)) $('zone').append(el('option', { value: zone, text: zone }));
+
+const coords = () => ZONES[$('zone').value];
+const customerId = () => Number($('customer').value);
+
+let searchTimer = null;
+$('q').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(search, 180);
+});
+
+async function search() {
+  const q = $('q').value.trim();
+  if (!q) return $('results').replaceChildren();
+  try {
+    const items = await api('customer', `/api/customer/medicines?q=${encodeURIComponent(q)}`);
+    renderResults(items);
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function renderResults(items) {
+  if (!items.length) {
+    return $('results').replaceChildren(el('p', { class: 'empty', text: 'Nothing matched.' }));
+  }
+  const rows = items.map((item) =>
+    el('tr', {},
+      el('td', {}, el('div', { text: item.name }),
+        el('div', { class: 'note', text: `${item.composition} · ${item.pack}` })),
+      el('td', {}, schedulePill(item.schedule),
+        item.is_chronic_care ? el('span', { class: 'pill ok', text: 'refill' }) : null),
+      el('td', { class: 'num', text: `₹${item.mrp}` }),
+      el('td', { class: 'num' },
+        el('button', { class: 'secondary', onclick: () => addToBasket(item) }, 'Add')),
+    ));
+  $('results').replaceChildren(
+    el('table', {},
+      el('thead', {}, el('tr', {},
+        el('th', { text: 'Medicine' }), el('th', { text: 'Category' }),
+        el('th', { class: 'num', text: 'MRP' }), el('th', {}))),
+      el('tbody', {}, rows)),
+  );
+}
+
+function addToBasket(item) {
+  const existing = basket.get(item.id);
+  basket.set(item.id, { item, qty: existing ? existing.qty + 1 : 1 });
+  renderBasket();
+}
+
+function renderBasket() {
+  clearBanner($('banner'));
+  if (!basket.size) {
+    $('basket').replaceChildren(el('p', { class: 'empty', text: 'Basket is empty.' }));
+    $('quote').replaceChildren();
+    $('rx-block').hidden = true;
+    $('place').disabled = true;
+    return;
+  }
+  const rows = [...basket.values()].map(({ item, qty }) =>
+    el('tr', {},
+      el('td', { text: item.name }),
+      el('td', {}, schedulePill(item.schedule)),
+      el('td', { class: 'num', text: qty }),
+      el('td', { class: 'num' },
+        el('button', {
+          class: 'secondary',
+          onclick: () => { basket.delete(item.id); renderBasket(); },
+        }, 'Remove')),
+    ));
+  $('basket').replaceChildren(
+    el('table', {}, el('tbody', {}, rows)),
+  );
+  refreshQuote();
+}
+
+async function refreshQuote() {
+  const [lat, lng] = coords();
+  const lines = [...basket.values()].map(({ item, qty }) => ({ medicine_id: item.id, qty }));
+  try {
+    const quote = await api('customer', '/api/customer/quote', {
+      method: 'POST',
+      body: { customer_id: customerId(), lines, delivery_lat: lat, delivery_lng: lng },
+    });
+    const saving = Number(quote.chemist_funded_discount) > 0;
+    $('quote').replaceChildren(
+      el('div', { class: 'grid' },
+        stat('Chemist', quote.chemist_name),
+        stat('Estimated', `${quote.eta_minutes} min`),
+        stat('Promise', `${quote.promise_minutes} min`),
+        stat('Total', `₹${quote.total}`)),
+      el('p', { class: 'note' },
+        `Subtotal ₹${quote.subtotal} + delivery ₹${quote.delivery_fee}`,
+        saving ? ` · chemist discount ₹${quote.chemist_funded_discount}` : ''),
+    );
+    $('rx-block').hidden = !quote.requires_prescription;
+    $('place').disabled = quote.requires_prescription && !prescriptionId;
+  } catch (err) {
+    $('quote').replaceChildren(el('div', { class: `banner ${err.status === 451 ? 'err' : 'info'}`, text: err.message }));
+    $('place').disabled = true;
+    // A Schedule X refusal is final: no amount of paperwork makes it orderable.
+    if (err.status === 451) $('rx-block').hidden = true;
+  }
+}
+
+function stat(k, v) {
+  return el('div', { class: 'stat' }, el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }));
+}
+
+$('rx-upload').addEventListener('click', async () => {
+  const file = $('rx-file').files[0];
+  if (!file) return banner($('banner'), 'err', 'Choose a prescription image first.');
+  const form = new FormData();
+  form.append('customer_id', customerId());
+  form.append('file', file);
+  if ($('rx-doctor').value) form.append('prescriber_name', $('rx-doctor').value);
+  if ($('rx-reg').value) form.append('prescriber_reg_no', $('rx-reg').value);
+  try {
+    const rx = await api('customer', '/api/customer/prescriptions', { method: 'POST', form });
+    prescriptionId = rx.id;
+    $('rx-status').replaceChildren(
+      el('div', { class: 'banner ok' }, `Prescription #${rx.id} uploaded. A pharmacist will verify it.`),
+    );
+    refreshQuote();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+});
+
+$('clear').addEventListener('click', () => {
+  basket.clear();
+  prescriptionId = null;
+  $('rx-status').replaceChildren();
+  renderBasket();
+});
+
+$('zone').addEventListener('change', () => basket.size && refreshQuote());
+$('customer').addEventListener('change', () => {
+  prescriptionId = null;
+  $('rx-status').replaceChildren();
+  basket.size && refreshQuote();
+});
+
+$('place').addEventListener('click', async () => {
+  const [lat, lng] = coords();
+  const lines = [...basket.values()].map(({ item, qty }) => ({ medicine_id: item.id, qty }));
+  try {
+    const order = await api('customer', '/api/customer/orders', {
+      method: 'POST',
+      body: {
+        customer_id: customerId(), lines, delivery_zone: $('zone').value,
+        delivery_lat: lat, delivery_lng: lng, prescription_id: prescriptionId,
+      },
+    });
+    orderId = order.id;
+    renderOrder(order);
+    startPolling();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+});
+
+function renderOrder(order) {
+  const items = order.items.map((item) =>
+    el('tr', {}, el('td', { text: item.medicine_name }), el('td', {}, schedulePill(item.schedule)),
+      el('td', { class: 'num', text: item.qty }), el('td', { class: 'num', text: `₹${item.line_total}` })));
+  const late = order.sla_breached;
+  $('order').replaceChildren(
+    el('div', { class: 'flex' },
+      el('strong', { text: `Order #${order.id}` }), statusPill(order.status),
+      el('span', {
+        class: `pill ${late ? 'bad' : 'ok'}`,
+        text: order.promise_honoured === true
+          ? 'delivered on time'
+          : late ? `${Math.abs(order.minutes_remaining)} min over` : `${order.minutes_remaining} min left`,
+      })),
+    el('p', { text: order.customer_message }),
+    order.closed_reason ? el('p', { class: 'note', text: order.closed_reason }) : null,
+    el('table', {}, el('tbody', {}, items)),
+    el('p', { class: 'note', text: `Chemist: ${order.chemist_name || '—'} · Total ₹${order.total}` }),
+  );
+}
+
+function startPolling() {
+  clearInterval(poller);
+  poller = setInterval(async () => {
+    if (!orderId) return;
+    try {
+      const order = await api('customer', `/api/customer/orders/${orderId}?customer_id=${customerId()}`);
+      renderOrder(order);
+      if (['DELIVERED', 'CANCELLED_STOCK_OUT', 'REJECTED_PRESCRIPTION',
+           'CANCELLED_BY_CUSTOMER', 'CANCELLED_NO_CHEMIST'].includes(order.status)) {
+        clearInterval(poller);
+      }
+    } catch { /* keep polling; a transient failure is not worth a banner */ }
+  }, 4000);
+}
+
+renderBasket();
+$('q').value = 'para';
+search();
+</script>
+</body>
+</html>

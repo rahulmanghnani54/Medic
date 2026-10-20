@@ -1,0 +1,7 @@
+fastapi==0.156.0
+uvicorn[standard]==0.38.0
+sqlalchemy==2.0.44
+pydantic==2.12.4
+# Required by FastAPI to parse multipart form data (prescription uploads).
+# Not imported directly.
+python-multipart==0.0.20

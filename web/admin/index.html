@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pharmacist and ops console</title>
+<link rel="icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="header"></div>
+<main>
+  <div id="banner"></div>
+
+  <section>
+    <h2>Prescription verification queue</h2>
+    <p class="note">
+      Nothing scheduled is dispensed until a pharmacist acts here. Authorise the exact
+      quantity you are satisfied with — the platform will not dispense more than that,
+      on this order or a later one.
+    </p>
+    <div id="queue"><p class="empty">Queue is empty.</p></div>
+  </section>
+
+  <section>
+    <h2>Live orders against the 60-minute clock</h2>
+    <div id="sla"><p class="empty">No live orders.</p></div>
+  </section>
+
+  <section>
+    <h2>Measured unit economics</h2>
+    <div id="economics"></div>
+  </section>
+
+  <section>
+    <h2>Catalogue and schedule tagging</h2>
+    <p class="note">
+      Every prescription rule follows from the schedule tag on these rows. A wrong tag
+      is a compliance failure, not a data-quality nit.
+    </p>
+    <div id="catalogue"><p class="empty">Loading…</p></div>
+  </section>
+
+  <section>
+    <h2>Audit trail</h2>
+    <div id="audit"><p class="empty">Loading…</p></div>
+  </section>
+</main>
+
+<script type="module">
+import { api, el, banner, clearBanner, statusPill, schedulePill, pageHeader } from '/static/api.js';
+
+const $ = (id) => document.getElementById(id);
+document.getElementById('header').replaceWith(pageHeader('Pharmacist and ops console', 'pharmacist / admin'));
+
+async function loadQueue() {
+  try {
+    const rows = await api('pharmacist', '/api/admin/verification-queue');
+    if (!rows.length) {
+      return $('queue').replaceChildren(el('p', { class: 'empty', text: 'Queue is empty.' }));
+    }
+    $('queue').replaceChildren(...rows.map(queueCard));
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function queueCard(row) {
+  const rx = row.prescription;
+  const clocks = row.orders_waiting.map((o) =>
+    el('span', {
+      class: `pill ${o.minutes_remaining <= 15 ? 'bad' : 'wait'}`,
+      text: `#${o.order_id}: ${o.minutes_remaining} min left`,
+    }));
+  // Deduplicate the requested lines; the same medicine can appear on several orders.
+  const seen = new Map();
+  for (const item of row.requested_items) {
+    const current = seen.get(item.medicine_id);
+    seen.set(item.medicine_id, current ? { ...current, qty: current.qty + item.qty } : { ...item });
+  }
+  const items = [...seen.values()];
+
+  return el('div', { class: 'stat', style: 'margin-bottom:10px' },
+    el('div', { class: 'flex' },
+      el('strong', { text: `Prescription #${rx.id}` }),
+      statusPill(rx.status),
+      row.is_reupload
+        ? el('span', { class: 'pill bad', text: `same image as #${rx.duplicate_of_id}` }) : null,
+      ...clocks),
+    el('p', { class: 'note' },
+      `Prescriber: ${rx.prescriber_name || 'not stated'}`,
+      rx.prescriber_reg_no ? ` (${rx.prescriber_reg_no})` : '',
+      ` · uploaded ${new Date(rx.created_at).toLocaleTimeString()}`,
+      ` · use ${rx.uses_count}/${rx.max_uses}`),
+    row.is_reupload
+      ? el('div', { class: 'banner info' },
+          'This is a byte-identical re-upload of an earlier prescription. Check it is not '
+          + 'being reused to obtain repeat supply of a habit-forming medicine.')
+      : null,
+    el('table', { style: 'margin:10px 0' },
+      el('thead', {}, el('tr', {},
+        el('th', { text: 'Requested' }), el('th', { text: 'Category' }),
+        el('th', { class: 'num', text: 'Asked' }), el('th', { class: 'num', text: 'Authorise' }))),
+      el('tbody', {}, items.map((item) =>
+        el('tr', {},
+          el('td', { text: item.medicine_name }),
+          el('td', {}, schedulePill(item.schedule)),
+          el('td', { class: 'num', text: item.qty }),
+          el('td', { class: 'num' },
+            el('input', {
+              type: 'number', min: '0', value: item.qty, style: 'width:80px',
+              'data-rx': rx.id, 'data-medicine': item.medicine_id,
+            })))))),
+    el('div', { class: 'row' },
+      el('div', {}, el('label', { text: 'Verifying pharmacist' }),
+        el('input', { id: `ph-${rx.id}`, value: 'Ph. R Nair' })),
+      el('div', { style: 'flex:0 0 auto' },
+        el('button', { onclick: () => verify(rx.id) }, 'Verify and release')),
+      el('div', { style: 'flex:0 0 auto' },
+        el('button', { class: 'danger', onclick: () => reject(rx.id) }, 'Reject'))),
+  );
+}
+
+async function verify(rxId) {
+  const inputs = [...document.querySelectorAll(`input[data-rx="${rxId}"]`)];
+  const authorisations = inputs
+    .map((input) => ({
+      medicine_id: Number(input.dataset.medicine),
+      authorised_qty: Number(input.value),
+    }))
+    .filter((row) => row.authorised_qty > 0);
+  if (!authorisations.length) {
+    return banner($('banner'), 'err', 'Authorise at least one medicine, or reject the prescription.');
+  }
+  try {
+    await api('pharmacist', `/api/admin/prescriptions/${rxId}/verify`, {
+      method: 'POST',
+      body: { authorisations, pharmacist: $(`ph-${rxId}`).value || 'pharmacist' },
+    });
+    banner($('banner'), 'ok', `Prescription #${rxId} verified.`);
+    refresh();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function reject(rxId) {
+  const reason = prompt('Reason (the patient is told this):', '');
+  if (!reason) return;
+  try {
+    await api('pharmacist', `/api/admin/prescriptions/${rxId}/reject`, {
+      method: 'POST', body: { reason },
+    });
+    banner($('banner'), 'ok', `Prescription #${rxId} rejected.`);
+    refresh();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function loadSla() {
+  try {
+    const rows = await api('admin', '/api/admin/sla');
+    if (!rows.length) {
+      return $('sla').replaceChildren(el('p', { class: 'empty', text: 'No live orders.' }));
+    }
+    $('sla').replaceChildren(
+      el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', { text: 'Order' }), el('th', { text: 'Status' }), el('th', { text: 'Zone' }),
+          el('th', { text: 'Chemist' }), el('th', { text: 'Waiting on' }),
+          el('th', { class: 'num', text: 'Clock' }), el('th', {}))),
+        el('tbody', {}, rows.map((row) =>
+          el('tr', {},
+            el('td', { text: `#${row.order_id}` }),
+            el('td', {}, statusPill(row.status)),
+            el('td', { text: row.zone }),
+            el('td', { text: row.chemist_name || '—' }),
+            el('td', { text: row.waiting_on }),
+            el('td', { class: 'num' },
+              el('span', {
+                class: `pill ${row.breached ? 'bad' : row.at_risk ? 'wait' : 'ok'}`,
+                text: row.breached
+                  ? `${Math.abs(row.minutes_remaining)} min over`
+                  : `${row.minutes_remaining} min`,
+              })),
+            el('td', { class: 'num' }, actionsFor(row)))))),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function actionsFor(row) {
+  if (row.status === 'READY_FOR_PICKUP') {
+    return el('button', { class: 'secondary', onclick: () => dispatch(row.order_id) }, 'Dispatch');
+  }
+  if (row.status === 'OUT_FOR_DELIVERY') {
+    return el('button', { class: 'secondary', onclick: () => deliver(row.order_id) }, 'Mark delivered');
+  }
+  return el('span', { class: 'note', text: '—' });
+}
+
+async function dispatch(orderId) {
+  const rider = prompt('Rider:', 'rider-1');
+  if (!rider) return;
+  try {
+    await api('admin', `/api/admin/orders/${orderId}/dispatch`, { method: 'POST', body: { rider } });
+    refresh();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function deliver(orderId) {
+  try {
+    await api('admin', `/api/admin/orders/${orderId}/deliver`, { method: 'POST' });
+    refresh();
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function loadEconomics() {
+  try {
+    const e = await api('admin', '/api/admin/economics');
+    $('economics').replaceChildren(
+      el('div', { class: 'grid' },
+        stat('Delivered orders', e.delivered_orders),
+        stat('Mean order value', `₹${e.mean_order_value}`),
+        stat('Mean commission', `₹${e.mean_commission}`),
+        stat('Mean contribution', `₹${e.mean_contribution}`),
+        stat('On time', e.on_time_rate === null ? '—' : `${Math.round(e.on_time_rate * 100)}%`),
+        stat('Break-even / month',
+          e.break_even_orders_per_month === null
+            ? 'not reached'
+            : e.break_even_orders_per_month.toLocaleString('en-IN') + ' orders')),
+      el('p', { class: 'note', text: e.assumptions_note }),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function stat(k, v) {
+  return el('div', { class: 'stat' },
+    el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }));
+}
+
+// An item we will never dispense needs no further controls listed against it:
+// showing "prescription" beside "not dispensable" reads as though some paperwork
+// would unlock it.
+function controlPills(row) {
+  if (!row.requires_prescription && !row.cold_chain) {
+    return el('span', { class: 'note', text: 'no controls' });
+  }
+  if (row.schedule === 'X') {
+    return el('span', { class: 'pill bad', text: 'not dispensable' });
+  }
+  return [
+    el('span', { class: 'pill rx', text: 'prescription' }),
+    row.requires_register_entry ? el('span', { class: 'pill rx', text: 'register entry' }) : null,
+    row.cold_chain ? el('span', { class: 'pill wait', text: 'cold chain' }) : null,
+  ].filter(Boolean);
+}
+
+async function loadCatalogue() {
+  try {
+    const rows = await api('admin', '/api/admin/catalogue');
+    $('catalogue').replaceChildren(
+      el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', { text: 'Medicine' }), el('th', { text: 'Schedule' }),
+          el('th', { class: 'num', text: 'MRP' }), el('th', { class: 'num', text: 'DPCO ceiling' }),
+          el('th', { text: 'Controls' }))),
+        el('tbody', {}, rows.map((row) =>
+          el('tr', {},
+            el('td', { text: row.name }),
+            el('td', {}, schedulePill(row.schedule)),
+            el('td', { class: 'num', text: `₹${row.mrp}` }),
+            el('td', { class: 'num', text: row.dpco_ceiling ? `₹${row.dpco_ceiling}` : '—' }),
+            el('td', { class: 'flex' }, controlPills(row)))))),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+async function loadAudit() {
+  try {
+    const events = await api('admin', '/api/admin/audit?limit=40');
+    if (!events.length) {
+      return $('audit').replaceChildren(el('p', { class: 'empty', text: 'Nothing recorded yet.' }));
+    }
+    $('audit').replaceChildren(
+      el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', { text: 'When' }), el('th', { text: 'Actor' }),
+          el('th', { text: 'Action' }), el('th', { text: 'Subject' }), el('th', { text: 'Detail' }))),
+        el('tbody', {}, events.map((event) =>
+          el('tr', {},
+            el('td', { text: new Date(event.at).toLocaleTimeString() }),
+            el('td', { text: event.actor }),
+            el('td', {}, el('code', { text: event.action })),
+            el('td', { text: event.subject }),
+            el('td', { class: 'note', text: event.detail || '' }))))),
+    );
+  } catch (err) {
+    banner($('banner'), 'err', err.message);
+  }
+}
+
+function refresh() {
+  clearBanner($('banner'));
+  loadQueue();
+  loadSla();
+  loadEconomics();
+  loadAudit();
+}
+
+refresh();
+loadCatalogue();
+setInterval(() => { loadQueue(); loadSla(); }, 8000);
+</script>
+</body>
+</html>
