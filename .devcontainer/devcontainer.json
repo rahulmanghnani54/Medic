@@ -1,0 +1,32 @@
+{
+  "name": "Medic — 60-minute medicine delivery",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  // Installs dependencies and seeds the Jaipur pilot data, so the Codespace
+  // is ready to run with one command. Runs once, when the container is built.
+  "postCreateCommand": "pip install --user -r requirements-dev.txt && python -m medic.seed",
+
+  // Printed every time you attach, because on a tablet the useful thing is
+  // the command you can copy, not a README you have to scroll.
+  "postAttachCommand": {
+    "hint": "bash -lc 'echo; echo \"Start everything with:\"; echo \"  MEDIC_RUN_WORKER=1 python -m uvicorn medic.main:app --host 0.0.0.0 --port 8000\"; echo; echo \"Then open the forwarded port 8000 in the PORTS tab.\"; echo'"
+  },
+
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "Medic consoles",
+      "onAutoForward": "notify"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"],
+      "settings": {
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"]
+      }
+    }
+  }
+}

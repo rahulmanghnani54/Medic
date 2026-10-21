@@ -15,6 +15,7 @@ pilot without removing any.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -108,14 +109,21 @@ def tick(
     return report
 
 
-def run_forever(*, interval_seconds: float = 5.0, config: Settings = settings) -> None:
-    """Drive the loop until the process is stopped.
+def run_forever(
+    *,
+    interval_seconds: float = 5.0,
+    config: Settings = settings,
+    stop: threading.Event | None = None,
+) -> None:
+    """Drive the loop until stopped.
 
     Each tick opens its own transaction: a failure in one pass must not leave
-    the next one working inside a poisoned session.
+    the next one working inside a poisoned session. `stop` lets a host process
+    shut the loop down cleanly instead of relying on the thread being a
+    daemon.
     """
     log.info("dispatch worker started, tick every %.1fs", interval_seconds)
-    while True:
+    while not (stop is not None and stop.is_set()):
         try:
             with session_scope() as session:
                 report = tick(session, config=config)
@@ -132,7 +140,13 @@ def run_forever(*, interval_seconds: float = 5.0, config: Settings = settings) -
                 log.warning("tick problem: %s", problem)
         except Exception:  # noqa: BLE001 - the loop outlives any single failure
             log.exception("dispatch tick failed")
-        time.sleep(interval_seconds)
+        if stop is not None:
+            # Waiting on the event rather than sleeping means shutdown is
+            # immediate instead of up to one tick late.
+            stop.wait(interval_seconds)
+        else:
+            time.sleep(interval_seconds)
+    log.info("dispatch worker stopped")
 
 
 def main() -> None:

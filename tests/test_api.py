@@ -106,7 +106,20 @@ def test_a_customer_cannot_reach_the_pharmacist_queue(client, headers):
 
 
 def test_healthz_needs_no_token(client):
-    assert client.get("/healthz").json() == {"status": "ok"}
+    body = client.get("/healthz").json()
+    assert body["status"] == "ok"
+
+
+def test_healthz_reports_whether_the_dispatch_loop_is_running(client):
+    """A server with no loop answers every request and advances no order.
+
+    That is the hardest kind of broken to notice, so liveness has to say
+    which mode it is in rather than just "ok".
+    """
+    body = client.get("/healthz").json()
+    assert "dispatch_loop_in_process" in body
+    # The test app runs without MEDIC_RUN_WORKER, so it must say so.
+    assert body["dispatch_loop_in_process"] is False
 
 
 # --- Catalogue ------------------------------------------------------------

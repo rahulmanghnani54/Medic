@@ -18,10 +18,21 @@ Zomato"* — with the compliance rules enforced in code rather than in process.
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m medic.seed              # Jaipur zones, 5 chemists, 4 couriers, 14 medicines
+.venv/bin/python -m medic.seed    # Jaipur zones, 5 chemists, 4 couriers, 14 medicines
+
+# One process: the web server hosts the dispatch loop too.
+MEDIC_RUN_WORKER=1 .venv/bin/python -m uvicorn medic.main:app --reload
+
+# Or run the loop separately, which is what a real deployment should do:
 .venv/bin/python -m uvicorn medic.main:app --reload
-.venv/bin/python -m medic.services.workers  # in a second terminal: the dispatch loop
+.venv/bin/python -m medic.services.workers   # second terminal
 ```
+
+Something has to run the dispatch loop. Without it, offers never expire and
+every order stalls after its first one — the app answers every request
+correctly and quietly does nothing. `GET /healthz` reports
+`dispatch_loop_in_process` so you can tell which mode you are in, and the
+server logs a warning at startup when no loop is running in it.
 
 | | |
 |---|---|
@@ -36,9 +47,23 @@ python3 -m venv .venv
 .venv/bin/ruff check medic/ tests/
 ```
 
-The worker is what makes expiry and re-offering happen. Without it an
-unanswered offer just sits there; the API still works, orders simply stall
-after the first offer.
+### Running it from a tablet or a Chromebook
+
+The stack needs compiled extensions (pydantic-core is Rust, h3 is C), so it
+cannot run natively on iPadOS — no Python environment there installs those.
+Run it somewhere else and open the consoles in the browser; they are plain
+HTML and work at phone width.
+
+The quickest route is GitHub Codespaces, which this repo is set up for:
+**Code → Codespaces → Create codespace on this branch**. Dependencies install
+and the database seeds automatically, then:
+
+```bash
+MEDIC_RUN_WORKER=1 python -m uvicorn medic.main:app --host 0.0.0.0 --port 8000
+```
+
+Open the forwarded port 8000 from the PORTS tab. `--host 0.0.0.0` matters:
+bound to localhost the port is not forwarded out of the container.
 
 ## The architecture, in one idea
 

@@ -82,6 +82,17 @@ class Settings:
         }
     )
 
+    # Run the dispatch loop inside the web process instead of as a second
+    # command. Convenient when you only have one terminal -- a tablet, a
+    # single Codespace pane -- but it ties the loop's lifetime to the web
+    # server's, so a real deployment should still run it separately.
+    run_worker_in_process: bool = os.environ.get("MEDIC_RUN_WORKER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    worker_tick_seconds: float = float(os.environ.get("MEDIC_WORKER_TICK", "5"))
+
     database_url: str = os.environ.get("MEDIC_DATABASE_URL", "sqlite:///./medic.sqlite3")
     upload_dir: str = os.environ.get("MEDIC_UPLOAD_DIR", "./uploads")
 

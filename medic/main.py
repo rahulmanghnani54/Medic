@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -29,6 +30,7 @@ from medic.domain.orders import IllegalGateTransition, IllegalTransition, Sourci
 from medic.domain.prescriptions import PrescriptionProblem
 from medic.domain.pricing import CommissionOutOfBand, PriceCapBreach
 from medic.domain.schedules import NotDispensableOnline
+from medic.services import workers
 from medic.services.couriers import CourierError
 from medic.services.dispatching import DispatchError
 from medic.services.dispensing import DispensingRefused
@@ -47,7 +49,41 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             "Running with the built-in development tokens. Set MEDIC_TOKEN_* before "
             "exposing this to anything but localhost."
         )
+
+    # Optionally host the dispatch loop in this process. Without a loop running
+    # somewhere, offers never expire and an order stalls after its first one,
+    # so a single-process mode is the difference between "the app runs" and
+    # "the app works" when you only have one terminal.
+    stop = threading.Event()
+    worker: threading.Thread | None = None
+    if settings.run_worker_in_process:
+        worker = threading.Thread(
+            target=workers.run_forever,
+            kwargs={"interval_seconds": settings.worker_tick_seconds, "stop": stop},
+            name="medic-dispatch",
+            daemon=True,
+        )
+        worker.start()
+        log.warning(
+            "Dispatch loop running in this process, ticking every %.1fs.",
+            settings.worker_tick_seconds,
+        )
+    else:
+        # Logged at WARNING deliberately. Without a loop running somewhere,
+        # offers never expire and every order stalls after its first one --
+        # the app will look like it works and quietly will not.
+        log.warning(
+            "Dispatch loop is NOT running in this process. Offers will never expire. "
+            "Run `python -m medic.services.workers` alongside this, or restart with "
+            "MEDIC_RUN_WORKER=1."
+        )
+    app.state.worker_thread = worker
+
     yield
+
+    stop.set()
+    if worker is not None:
+        worker.join(timeout=settings.worker_tick_seconds + 2)
 
 
 app = FastAPI(
@@ -155,8 +191,18 @@ app.include_router(courier.router)
 
 
 @app.get("/healthz", include_in_schema=False)
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> dict[str, object]:
+    """Liveness, plus whether the dispatch loop is actually running.
+
+    Worth reporting: a server with no loop answers every request correctly
+    and still never advances an order past its first offer, which is the
+    hardest kind of broken to notice.
+    """
+    worker = getattr(app.state, "worker_thread", None)
+    return {
+        "status": "ok",
+        "dispatch_loop_in_process": bool(worker is not None and worker.is_alive()),
+    }
 
 
 @app.get("/", include_in_schema=False)
