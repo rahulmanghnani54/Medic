@@ -51,19 +51,38 @@ server logs a warning at startup when no loop is running in it.
 
 The stack needs compiled extensions (pydantic-core is Rust, h3 is C), so it
 cannot run natively on iPadOS — no Python environment there installs those.
-Run it somewhere else and open the consoles in the browser; they are plain
+The tablet is the screen; something else is the host. The consoles are plain
 HTML and work at phone width.
 
-The quickest route is GitHub Codespaces, which this repo is set up for:
-**Code → Codespaces → Create codespace on this branch**. Dependencies install
-and the database seeds automatically, then:
+Either way, `./start.sh` does the whole setup: virtualenv, dependencies,
+seed data, server and dispatch loop, in one command. Re-running it is cheap,
+because each step is skipped once done.
+
+**GitHub Codespaces** — this repo has a devcontainer, so *Code → Codespaces →
+Create codespace* installs and seeds on its own. Then:
 
 ```bash
-MEDIC_RUN_WORKER=1 python -m uvicorn medic.main:app --host 0.0.0.0 --port 8000
+./start.sh --public
 ```
 
-Open the forwarded port 8000 from the PORTS tab. `--host 0.0.0.0` matters:
-bound to localhost the port is not forwarded out of the container.
+Open the forwarded port 8000 from the PORTS tab. `--public` matters: bound to
+localhost, the port is not forwarded out of the container.
+
+**SSH from a tablet** (Termius, Blink, or any SSH client) into your own
+machine or a small VPS:
+
+```bash
+git clone -b claude/india-medicine-delivery-apps-71uhup <repo> && cd Medic
+./start.sh
+```
+
+Then forward the port in your SSH client — `-L 8000:localhost:8000` — and open
+`http://localhost:8000/customer/` in the tablet's browser.
+
+Prefer the tunnel over `--public` on anything reachable from the internet.
+Authentication here is a shared static token per role, printed in this
+repository, so a publicly bound port is an open door. Over a tunnel the server
+stays on localhost and nothing is exposed.
 
 ## The architecture, in one idea
 
